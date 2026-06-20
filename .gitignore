@@ -1,0 +1,14 @@
+*.iml
+.gradle/
+.kotlin/
+/local.properties
+/build/
+/app/build/
+.idea/
+.claude/
+
+# Signing key — never commit. Build references it via app/build.gradle.kts;
+# keep it backed up out-of-band (losing it means future updates can't install
+# over an existing install without uninstalling first).
+*.jks
+*.keystore

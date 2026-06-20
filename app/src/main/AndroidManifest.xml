@@ -1,0 +1,118 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <!-- specialUse (not dataSync): dataSync FGS is capped at 6h/day on API 35,
+         which would kill a persistent push bridge. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+    <!-- Android 17+ gates cross-profile loopback (127.0.0.1) behind this permission.
+         It is signature/privileged/development, so it is NOT auto-granted to a
+         sideloaded app, but the development flag lets ADB grant it without root
+         (pm grant ... INTERACT_ACROSS_USERS per profile; see README). Harmless and
+         unused on Android 16 and earlier, where loopback crosses profiles freely. -->
+    <uses-permission android:name="android.permission.INTERACT_ACROSS_USERS"
+        tools:ignore="ProtectedPermissions" />
+
+    <!-- Package visibility (API 30+): discover/talk to UnifiedPush distributors
+         (the ntfy app) by their REGISTER receiver. -->
+    <queries>
+        <intent>
+            <action android:name="org.unifiedpush.android.distributor.REGISTER" />
+        </intent>
+    </queries>
+
+    <application
+        android:name=".App"
+        android:allowBackup="false"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:label="@string/app_name"
+        android:supportsRtl="true"
+        android:theme="@android:style/Theme.DeviceDefault.DayNight">
+
+        <!-- Status / control UI; also the place the user first starts the FGS. -->
+        <activity
+            android:name=".ui.MainActivity"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!-- ============ UnifiedPush distributor surface (private side) ============ -->
+
+        <!-- The unifiedpush://link deep-link target used by the connector. -->
+        <activity
+            android:name=".distributor.LinkActivity"
+            android:exported="true"
+            android:theme="@android:style/Theme.NoDisplay">
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:scheme="unifiedpush" android:host="link" />
+            </intent-filter>
+        </activity>
+
+        <!-- Receiver that marks this app as a UnifiedPush distributor and
+             accepts REGISTER / UNREGISTER / MESSAGE_ACK from connector apps. -->
+        <receiver
+            android:name=".distributor.RegisterReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="org.unifiedpush.android.distributor.REGISTER" />
+                <action android:name="org.unifiedpush.android.distributor.UNREGISTER" />
+                <action android:name="org.unifiedpush.android.distributor.MESSAGE_ACK" />
+                <!-- Advertise supported features. Connectors (jmap-mail) discover
+                     feature support via actions on this filter; BYTES_MESSAGE is
+                     required for binary (RFC 8291) payloads, and the connector
+                     filters out distributors that don't declare it. -->
+                <action android:name="org.unifiedpush.android.distributor.feature.BYTES_MESSAGE" />
+            </intent-filter>
+        </receiver>
+
+        <!-- Private-space foreground service: hosts the abstract-socket listener
+             and the distributor control/data logic. -->
+        <service
+            android:name=".distributor.DistributorService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Cross-profile UnifiedPush distributor: keeps the local push listener bound." />
+        </service>
+
+        <!-- ============ ntfy connector surface (owner side) ============ -->
+
+        <!-- Owner-side UnifiedPush *connector*. The ntfy app delivers here and
+             wakes us; we forward over the socket. No foreground service / no own
+             ntfy connection — the ntfy app holds the only radio. -->
+        <receiver
+            android:name=".owner.OwnerPushReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="org.unifiedpush.android.connector.MESSAGE" />
+                <action android:name="org.unifiedpush.android.connector.NEW_ENDPOINT" />
+                <action android:name="org.unifiedpush.android.connector.UNREGISTERED" />
+                <action android:name="org.unifiedpush.android.connector.REGISTRATION_FAILED" />
+            </intent-filter>
+        </receiver>
+
+        <!-- Restart the role-appropriate component after boot / update. -->
+        <receiver
+            android:name=".boot.BootReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+            </intent-filter>
+        </receiver>
+
+    </application>
+</manifest>
