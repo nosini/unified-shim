@@ -19,6 +19,22 @@ class RegisterReceiver : BroadcastReceiver() {
         val action = intent.action ?: return
         Logx.i("recv", "$action token=${intent.getStringExtra(UnifiedPush.EXTRA_TOKEN)}")
 
+        // Backstop: persist registration state directly to the shared store BEFORE
+        // forwarding. If the FGS start below fails (background start restriction),
+        // the pending registration still survives and the owner's next reconcile
+        // (on boot / when the user opens the app) provisions it.
+        val store = EndpointStore.get(context)
+        when (action) {
+            UnifiedPush.ACTION_REGISTER -> {
+                val token = intent.getStringExtra(UnifiedPush.EXTRA_TOKEN)
+                val app = intent.getStringExtra(UnifiedPush.EXTRA_APPLICATION)
+                if (token != null && app != null) store.putPending(token, app)
+            }
+            UnifiedPush.ACTION_UNREGISTER -> {
+                intent.getStringExtra(UnifiedPush.EXTRA_TOKEN)?.let { store.markDeprovision(it) }
+            }
+        }
+
         val forward = Intent(context, DistributorService::class.java).apply {
             this.action = action
             putExtras(intent)
