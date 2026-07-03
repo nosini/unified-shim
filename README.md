@@ -48,6 +48,12 @@ OwnerPushReceiver (our connector, woken on demand)    EndpointStore
   short-lived socket connection, does its business, and closes.
 - **Role detection** (`role/RoleDetector.kt`): owner/system user has profile
   serial 0 → `OWNER`; anything else → `PRIVATE`. Override via `Config.forcedRole`.
+- **Components are role-gated at startup** (`App.onCreate` →
+  `setComponentEnabledSetting`): the distributor stack (`RegisterReceiver`,
+  `LinkActivity`, `DistributorService`) is disabled in the owner profile and the
+  connector (`OwnerPushReceiver`) in the private profile. So the wrong-profile
+  stack can't be triggered — e.g. a stray `REGISTER` can't start a second
+  listener that contends for `:28472` in the owner profile.
 
 ---
 
@@ -203,7 +209,15 @@ Logs: `adb logcat -s ushim`.
   reads them via `getByteArrayExtra`. jmap-mail decrypts with its Keystore key.
 - **First provisioning of a new account needs the owner app opened once** — the
   private side can't wake a sleeping owner. Subsequent pushes flow automatically.
-- **If the private space is unreachable when a push arrives**, the owner queues it
-  (`OwnerStore`) and flushes on the next connection. The premise is the private
-  space stays unlocked, so this is the rare case.
+- **Delivery is at-least-once with de-dupe.** Every push is written to the owner's
+  durable outbox (`OwnerStore`) *before* any send and removed only on its
+  `PUSH_ACK`, so an unreachable private side (locked / rebooting / Android-17 grant
+  missing) queues the push instead of dropping it; it flushes on the next
+  connection. The private side de-dupes by `msgId`, so a retried push isn't
+  delivered to jmap-mail twice. The premise is the private space stays unlocked,
+  so queuing is the rare case.
+- **A REGISTER is persisted even if the distributor FGS can't start** from the
+  background — `RegisterReceiver` writes the pending registration to the store
+  directly, so it isn't lost to the background-FGS-start restriction; the owner's
+  next reconcile provisions it.
 ```
