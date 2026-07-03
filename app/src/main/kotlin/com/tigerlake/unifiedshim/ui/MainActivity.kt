@@ -93,7 +93,7 @@ class MainActivity : Activity() {
         appendLine()
         when (role) {
             Role.PRIVATE -> {
-                val store = EndpointStore(this@MainActivity)
+                val store = EndpointStore.get(this@MainActivity)
                 appendLine("Registrations (${store.all().size}):")
                 store.all().forEach { r ->
                     appendLine("  • ${r.app}")
@@ -105,7 +105,7 @@ class MainActivity : Activity() {
             }
             Role.OWNER -> {
                 appendLine("ntfy distributor: ${UnifiedPush.getSavedDistributor(this@MainActivity) ?: "(none selected)"}")
-                val eps = OwnerStore(this@MainActivity).knownEndpoints()
+                val eps = OwnerStore.get(this@MainActivity).knownEndpoints()
                 appendLine("Provisioned endpoints (${eps.size}):")
                 eps.forEach { (token, ep) -> appendLine("  • $token\n    $ep") }
             }

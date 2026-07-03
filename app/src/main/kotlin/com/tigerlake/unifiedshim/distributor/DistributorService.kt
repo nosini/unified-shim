@@ -32,7 +32,7 @@ class DistributorService : Service() {
             ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE,
         )
 
-        controller = DistributorController(EndpointStore(this), AppMessenger(this))
+        controller = DistributorController(EndpointStore.get(this), AppMessenger(this))
         server = LoopbackServer(
             context = this,
             port = Config.BRIDGE_PORT,

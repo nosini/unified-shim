@@ -1,6 +1,7 @@
 package com.tigerlake.unifiedshim.distributor
 
 import android.content.Context
+import com.tigerlake.unifiedshim.common.Logx
 import org.json.JSONArray
 import org.json.JSONObject
 
@@ -15,7 +16,7 @@ import org.json.JSONObject
  * instance the owner hasn't released yet — kept until the owner confirms
  * (`DEPROVISIONED`), because the owner may be asleep when the unregister happens.
  */
-class EndpointStore(context: Context) {
+class EndpointStore private constructor(context: Context) {
 
     data class Reg(val token: String, val app: String, val endpoint: String?) {
         val pending get() = endpoint == null
@@ -83,16 +84,29 @@ class EndpointStore(context: Context) {
     }
 
     private fun load() {
-        prefs.getString("regs", null)?.let { raw ->
-            val root = JSONObject(raw)
-            for (token in root.keys()) {
-                val o = root.getJSONObject(token)
-                byToken[token] = Reg(token, o.getString("app"), o.optString("endpoint", "").ifEmpty { null })
+        try {
+            prefs.getString("regs", null)?.let { raw ->
+                val root = JSONObject(raw)
+                for (token in root.keys()) {
+                    val o = root.getJSONObject(token)
+                    byToken[token] = Reg(token, o.getString("app"), o.optString("endpoint", "").ifEmpty { null })
+                }
             }
+            prefs.getString("deprovision", null)?.let { raw ->
+                val arr = JSONArray(raw)
+                for (i in 0 until arr.length()) deprovision.add(arr.getString(i))
+            }
+        } catch (e: Exception) {
+            Logx.w("store", "corrupt endpoint prefs, starting empty: ${e.message}")
         }
-        prefs.getString("deprovision", null)?.let { raw ->
-            val arr = JSONArray(raw)
-            for (i in 0 until arr.length()) deprovision.add(arr.getString(i))
-        }
+    }
+
+    companion object {
+        @Volatile private var instance: EndpointStore? = null
+
+        fun get(context: Context): EndpointStore =
+            instance ?: synchronized(this) {
+                instance ?: EndpointStore(context.applicationContext).also { instance = it }
+            }
     }
 }

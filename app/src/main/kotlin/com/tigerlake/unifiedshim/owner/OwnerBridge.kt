@@ -41,20 +41,20 @@ object OwnerBridge {
             val ok = session.sendPushAndAwait(token, payload)
             if (!ok) {
                 Logx.w("owner", "push for token=$token not acked; queuing")
-                OwnerStore(context).enqueuePending(OwnerStore.PendingPush(token, payload))
+                OwnerStore.get(context).enqueuePending(OwnerStore.PendingPush(token, payload))
             }
             ok
         }
 
     /** A (new) endpoint minted by the ntfy app for one of our instances. */
     fun onEndpoint(context: Context, token: String, endpoint: String) {
-        OwnerStore(context).putEndpoint(token, endpoint)
+        OwnerStore.get(context).putEndpoint(token, endpoint)
         withSession(context, default = Unit) { session -> session.sendEndpoint(token, endpoint) }
     }
 
     /** The ntfy app released one of our instances. */
     fun onUnregistered(context: Context, token: String) {
-        OwnerStore(context).forget(token)
+        OwnerStore.get(context).forget(token)
         withSession(context, default = Unit) { session -> session.sendDeprovisioned(token) }
     }
 
@@ -98,7 +98,7 @@ object OwnerBridge {
      * already know, release deprovisioned tokens, and flush any queued pushes.
      */
     private fun applyReconcile(context: Context, session: Session, regs: Protocol.Registrations) {
-        val store = OwnerStore(context)
+        val store = OwnerStore.get(context)
         val distributorReady = UnifiedPush.getSavedDistributor(context) != null
 
         for (token in regs.active) {
