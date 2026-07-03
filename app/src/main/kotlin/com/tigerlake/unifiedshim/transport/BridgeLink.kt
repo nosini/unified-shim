@@ -26,6 +26,8 @@ class BridgeLink(
     private val writeLock = Any()
     private val closed = AtomicBoolean(false)
 
+    val isOpen: Boolean get() = !closed.get()
+
     fun start() {
         Thread({ readLoop() }, "bridge-link-reader").apply { isDaemon = true; start() }
     }

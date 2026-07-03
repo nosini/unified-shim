@@ -19,7 +19,7 @@ import org.json.JSONObject
  */
 class OwnerStore private constructor(context: Context) {
 
-    class PendingPush(val token: String, val payload: ByteArray)
+    class PendingPush(val msgId: Long, val token: String, val payload: ByteArray)
 
     private val prefs = context.applicationContext
         .getSharedPreferences("unifiedshim_owner", Context.MODE_PRIVATE)
@@ -48,17 +48,18 @@ class OwnerStore private constructor(context: Context) {
     }
 
     @Synchronized
-    fun enqueuePending(push: PendingPush) {
+    fun enqueue(push: PendingPush) {
         if (pending.size >= MAX_PENDING) pending.removeFirst()
         pending.addLast(push)
         persist()
     }
 
     @Synchronized
-    fun drainPending(): List<PendingPush> {
-        val out = pending.toList()
-        if (pending.isNotEmpty()) { pending.clear(); persist() }
-        return out
+    fun peekPending(): List<PendingPush> = pending.toList()
+
+    @Synchronized
+    fun removePending(msgId: Long) {
+        if (pending.removeAll { it.msgId == msgId }) persist()
     }
 
     private fun persist() {
@@ -66,7 +67,7 @@ class OwnerStore private constructor(context: Context) {
         endpoints.forEach { (k, v) -> eps.put(k, v) }
         val pp = JSONArray()
         pending.forEach {
-            pp.put(JSONObject().put("token", it.token).put("payload", Base64.encodeToString(it.payload, Base64.NO_WRAP)))
+            pp.put(JSONObject().put("msgId", it.msgId).put("token", it.token).put("payload", Base64.encodeToString(it.payload, Base64.NO_WRAP)))
         }
         prefs.edit().putString("endpoints", eps.toString()).putString("pending", pp.toString()).apply()
     }
@@ -81,7 +82,7 @@ class OwnerStore private constructor(context: Context) {
                 val arr = JSONArray(raw)
                 for (i in 0 until arr.length()) {
                     val o = arr.getJSONObject(i)
-                    pending.addLast(PendingPush(o.getString("token"), Base64.decode(o.getString("payload"), Base64.NO_WRAP)))
+                    pending.addLast(PendingPush(o.getLong("msgId"), o.getString("token"), Base64.decode(o.getString("payload"), Base64.NO_WRAP)))
                 }
             }
         } catch (e: Exception) {

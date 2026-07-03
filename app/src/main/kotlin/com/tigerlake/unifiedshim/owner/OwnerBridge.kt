@@ -35,16 +35,12 @@ object OwnerBridge {
 
     private val lock = Any()
 
-    /** Inbound push from the ntfy app. Returns true if delivered to the private side. */
-    fun deliver(context: Context, token: String, payload: ByteArray): Boolean =
-        withSession(context, default = false) { session ->
-            val ok = session.sendPushAndAwait(token, payload)
-            if (!ok) {
-                Logx.w("owner", "push for token=$token not acked; queuing")
-                OwnerStore.get(context).enqueuePending(OwnerStore.PendingPush(token, payload))
-            }
-            ok
-        }
+    /** Inbound push from the ntfy app. Durably enqueued first, then flushed. */
+    fun deliver(context: Context, token: String, payload: ByteArray) {
+        val msgId = msgIdSeq.incrementAndGet()
+        OwnerStore.get(context).enqueue(OwnerStore.PendingPush(msgId, token, payload))
+        withSession(context, default = Unit) { /* flush happens in withSession */ }
+    }
 
     /** A (new) endpoint minted by the ntfy app for one of our instances. */
     fun onEndpoint(context: Context, token: String, endpoint: String) {
@@ -71,6 +67,7 @@ object OwnerBridge {
             try {
                 session.regsLatch.await(REGS_TIMEOUT_MS, TimeUnit.MILLISECONDS)
                 session.registrations?.let { applyReconcile(context, session, it) }
+                flushOutbox(context, session)
                 return block(session)
             } finally {
                 session.close()
@@ -117,8 +114,16 @@ object OwnerBridge {
             store.forget(token)
             session.sendDeprovisioned(token)
         }
-        for (p in store.drainPending()) {
-            if (!session.sendPushAndAwait(p.token, p.payload)) store.enqueuePending(p)
+    }
+
+    /** Send queued pushes on the live link, removing each only when acked. Abort on
+     *  the first failure/closed link so a dead link can't burn one timeout per item. */
+    private fun flushOutbox(context: Context, session: Session) {
+        val store = OwnerStore.get(context)
+        for (p in store.peekPending()) {
+            if (!session.link.isOpen) break
+            if (session.sendPushAndAwait(p.msgId, p.token, p.payload)) store.removePending(p.msgId)
+            else break
         }
     }
 
@@ -157,12 +162,14 @@ object OwnerBridge {
         fun sendEndpoint(token: String, endpoint: String) = link.send(Protocol.endpoint(token, endpoint))
         fun sendDeprovisioned(token: String) = link.send(Protocol.deprovisioned(token))
 
-        fun sendPushAndAwait(token: String, payload: ByteArray): Boolean {
-            val msgId = msgIdSeq.incrementAndGet()
+        fun sendPushAndAwait(msgId: Long, token: String, payload: ByteArray): Boolean {
+            if (!link.isOpen) return false
             val latch = CountDownLatch(1)
             ackLatches[msgId] = latch
             link.send(Protocol.push(msgId, token, payload))
-            return latch.await(ACK_TIMEOUT_MS, TimeUnit.MILLISECONDS) && ackLatches[msgId] == null
+            val acked = latch.await(ACK_TIMEOUT_MS, TimeUnit.MILLISECONDS) && ackLatches[msgId] == null
+            ackLatches.remove(msgId)
+            return acked
         }
 
         fun close() = link.close()
