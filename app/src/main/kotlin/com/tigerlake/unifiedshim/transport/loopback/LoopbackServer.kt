@@ -79,7 +79,11 @@ class LoopbackServer(
                 sock.close()
                 return
             }
-            sock.soTimeout = 0
+            // Finite idle timeout + keepalive bound a dead-peer leak (owner process
+            // killed without a clean FIN); the owner connects per-push and closes
+            // within seconds, so it is never legitimately idle this long.
+            sock.keepAlive = true
+            sock.soTimeout = IDLE_TIMEOUT_MS
             val link = BridgeLink(input, output, sock, "127.0.0.1:${sock.port}", onFrame, onLinkClosed)
             Logx.i("server", "authenticated peer")
             onLink(link)
@@ -102,5 +106,6 @@ class LoopbackServer(
         private const val BACKLOG = 8
         private const val AUTH_TIMEOUT = 5_000
         private const val REBIND_DELAY = 3_000L
+        private const val IDLE_TIMEOUT_MS = 120_000
     }
 }

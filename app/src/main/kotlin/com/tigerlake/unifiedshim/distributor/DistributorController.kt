@@ -40,6 +40,7 @@ class DistributorController(
 
     /** Called after HELLO/HELLO_ACK completes for the owner link. */
     fun onOwnerLinkReady(l: BridgeLink) {
+        link?.takeIf { it !== l }?.close()
         link = l
         Logx.i("dist", "owner link ready; sending registration snapshot")
         sendSnapshot(l)
