@@ -65,8 +65,12 @@ object OwnerBridge {
         synchronized(lock) {
             val session = openSession(context) ?: return default
             try {
-                session.regsLatch.await(REGS_TIMEOUT_MS, TimeUnit.MILLISECONDS)
-                session.registrations?.let { applyReconcile(context, session, it) }
+                val gotSnapshot = session.regsLatch.await(REGS_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+                if (gotSnapshot) {
+                    session.registrations?.let { applyReconcile(context, session, it) }
+                } else {
+                    Logx.w("owner", "no registration snapshot within ${REGS_TIMEOUT_MS}ms; skipping reconcile this session")
+                }
                 flushOutbox(context, session)
                 return block(session)
             } finally {
