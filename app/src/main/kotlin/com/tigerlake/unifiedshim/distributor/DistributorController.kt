@@ -83,11 +83,20 @@ class DistributorController(
     fun onFrame(frame: Frame, l: BridgeLink) {
         when (frame.type) {
             Protocol.ENDPOINT -> handleEndpoint(frame)
-            Protocol.DEPROVISIONED -> {
-                store.confirmDeprovisioned(Protocol.parseJson(frame).getString("token"))
-            }
+            Protocol.DEPROVISIONED -> handleDeprovisioned(Protocol.parseJson(frame).getString("token"))
             Protocol.PUSH -> handlePush(frame, l)
             else -> Logx.w("dist", "unexpected frame type=${frame.type}")
+        }
+    }
+
+    private fun handleDeprovisioned(token: String) {
+        // Case (b): ntfy released an instance jmap-mail still wants -> reset to
+        // pending so the next owner reconcile re-registers and a fresh NEW_ENDPOINT
+        // reaches the app. Case (a): a genuine unregister confirmation -> clear it.
+        if (store.resetToPending(token)) {
+            Logx.i("dist", "endpoint released upstream for active token=$token; will re-provision")
+        } else {
+            store.confirmDeprovisioned(token)
         }
     }
 

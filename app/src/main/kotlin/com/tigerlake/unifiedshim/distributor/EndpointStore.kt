@@ -57,6 +57,18 @@ class EndpointStore private constructor(context: Context) {
         return true
     }
 
+    /** Upstream (ntfy) released the endpoint for a still-wanted registration:
+     *  drop it back to pending so the next reconcile re-registers and mints a
+     *  fresh endpoint. Returns true if the token was an active, provisioned reg. */
+    @Synchronized
+    fun resetToPending(token: String): Boolean {
+        val reg = byToken[token] ?: return false
+        if (reg.endpoint == null) return false
+        byToken[token] = reg.copy(endpoint = null)
+        persist()
+        return true
+    }
+
     /** jmap-mail unregistered: drop the reg, remember the token to release upstream. */
     @Synchronized
     fun markDeprovision(token: String): Reg? {
