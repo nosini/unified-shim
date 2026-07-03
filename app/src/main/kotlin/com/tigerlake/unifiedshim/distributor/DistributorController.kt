@@ -20,6 +20,22 @@ class DistributorController(
 ) {
     @Volatile private var link: BridgeLink? = null
 
+    /**
+     * Bounded LRU of msgIds we have already dispatched to the app. The owner's
+     * outbox is at-least-once, so the same msgId can arrive twice (e.g. an ack
+     * that landed after the owner's retry timeout). In-memory only: a re-delivery
+     * across process death is acceptable and rare.
+     */
+    private val delivered = object : LinkedHashMap<Long, Boolean>(16, 0.75f, true) {
+        override fun removeEldestEntry(eldest: Map.Entry<Long, Boolean>): Boolean = size > 1024
+    }
+
+    @Synchronized private fun alreadyDelivered(msgId: Long): Boolean = delivered.containsKey(msgId)
+
+    @Synchronized private fun markDelivered(msgId: Long) {
+        delivered[msgId] = true
+    }
+
     // ---- owner link lifecycle ----
 
     /** Called after HELLO/HELLO_ACK completes for the owner link. */
@@ -86,13 +102,25 @@ class DistributorController(
 
     private fun handlePush(frame: Frame, l: BridgeLink) {
         val push = Protocol.parsePush(frame)
-        // Ack the owner immediately so it can release the ntfy-app message.
-        l.send(Protocol.pushAck(push.msgId))
-        val reg = store.byToken(push.token)
-        if (reg == null) {
-            Logx.w("dist", "push for unknown token=${push.token}")
+        // Duplicate re-delivery: re-ack so the owner stops retrying, but don't
+        // broadcast again.
+        if (alreadyDelivered(push.msgId)) {
+            Logx.d("dist", "duplicate push msgId=${push.msgId}, re-acking")
+            l.send(Protocol.pushAck(push.msgId))
             return
         }
+        val reg = store.byToken(push.token)
+        if (reg == null) {
+            // Undeliverable (jmap-mail not/no-longer registered). Ack anyway so the
+            // owner drops it instead of retrying forever.
+            Logx.w("dist", "push for unknown token=${push.token}")
+            l.send(Protocol.pushAck(push.msgId))
+            return
+        }
+        // Dispatch first, then mark delivered and ack — acking before the broadcast
+        // would let the owner drop the payload before we've handed it to the app.
         messenger.message(reg.app, reg.token, push.payload, push.msgId)
+        markDelivered(push.msgId)
+        l.send(Protocol.pushAck(push.msgId))
     }
 }
