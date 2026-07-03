@@ -39,14 +39,17 @@ class LoopbackServer(
     }
 
     private fun bindAndAccept() {
+        var backoff = MIN_REBIND_DELAY
         while (running.get()) {
             val ss = try {
                 ServerSocket(port, BACKLOG, InetAddress.getByName("127.0.0.1"))
             } catch (e: Exception) {
-                Logx.w("server", "bind 127.0.0.1:$port failed: ${e.message}; retrying")
-                sleep(REBIND_DELAY)
+                Logx.w("server", "bind 127.0.0.1:$port failed: ${e.message}; retry in ${backoff}ms")
+                sleep(backoff)
+                backoff = (backoff * 2).coerceAtMost(MAX_REBIND_DELAY)
                 continue
             }
+            backoff = MIN_REBIND_DELAY
             serverSocket = ss
             Logx.i("server", "listening on 127.0.0.1:$port")
             acceptLoop(ss)
@@ -105,7 +108,8 @@ class LoopbackServer(
     companion object {
         private const val BACKLOG = 8
         private const val AUTH_TIMEOUT = 5_000
-        private const val REBIND_DELAY = 3_000L
+        private const val MIN_REBIND_DELAY = 3_000L
+        private const val MAX_REBIND_DELAY = 60_000L
         private const val IDLE_TIMEOUT_MS = 120_000
     }
 }
