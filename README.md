@@ -4,8 +4,8 @@ A standalone **cross-profile UnifiedPush bridge**. One APK, installed in two (or
 more) Android profiles, behaves differently per profile:
 
 - **Any non-owner profile** (private space *or* work profile) → acts as a standard
-  **UnifiedPush distributor**. Any unmodified UP app (e.g. jmap-mail) picks it from
-  the normal distributor picker. Multiple UP apps can register concurrently.
+  **UnifiedPush distributor**. Any unmodified UP app picks it from the normal
+  distributor picker. Multiple UP apps can register concurrently.
 - **Owner profile** → a UnifiedPush **connector** registered with the **ntfy
   app**. It never opens its own connection to ntfy — the ntfy app holds the only
   radio. When the ntfy app receives a push it wakes the owner shim, which forwards
@@ -27,8 +27,7 @@ netns, so each binds a **distinct, user-configurable port** (see
 The point: keep push working in the distributor profile **without any persistent
 radio connection there**. The owner profile already runs the ntfy app (its radio +
 foreground service); we add nothing persistent on either the owner radio path or
-the distributor profile beyond the listener. The UP app (jmap-mail) is **not
-modified**.
+the distributor profile beyond the listener. The UP app is **not modified**.
 
 ---
 
@@ -44,7 +43,7 @@ OwnerPushReceiver (our connector, woken on demand)    DistributorController
    │ OwnerBridge: one-shot loopback connect           EndpointStore
    │             (one per distributor port,           AppMessenger ─► UP broadcasts
    │              routed strictly by token)
-   └──── loopback TCP over shared netns (HMAC auth) ──► jmap-mail (any unmodified UP app)
+   └──── loopback TCP over shared netns (HMAC auth) ──► the UP app (unmodified)
 ```
 
 - **The distributor listens and stays foregrounded** — it can't be woken
@@ -69,7 +68,7 @@ OwnerPushReceiver (our connector, woken on demand)    DistributorController
 
 ## Flows
 
-**Registration / provisioning** — jmap-mail registers with the private distributor:
+**Registration / provisioning** — a UP app registers with the distributor:
 
 1. `RegisterReceiver` (REGISTER, advertises us as a distributor) → `DistributorService`.
 2. `DistributorController` stores a *pending* registration keyed by the connector
@@ -82,18 +81,18 @@ OwnerPushReceiver (our connector, woken on demand)    DistributorController
    against the **ntfy app**, using the *private token as the instance id*.
 5. The ntfy app mints a real ntfy endpoint and delivers it to the owner via
    `onNewEndpoint` (a fresh wakeup). The owner connects and sends `ENDPOINT`.
-6. The private side stores it and broadcasts `NEW_ENDPOINT` to jmap-mail.
-   jmap-mail registers that endpoint + its RFC 8291 Web Push keys with Stalwart.
+6. The private side stores it and broadcasts `NEW_ENDPOINT` to the app, which
+   registers that endpoint + its RFC 8291 Web Push keys with its own server.
 
 **Push** — server POSTs to the endpoint:
 
-1. Stalwart POSTs the aes128gcm-encrypted body to the ntfy endpoint.
+1. The app's server POSTs the aes128gcm-encrypted body to the ntfy endpoint.
 2. ntfy.sh → the **ntfy app** over its websocket → ntfy app broadcasts `MESSAGE`
    to our `OwnerPushReceiver`, which wakes the owner shim. The instance id is the
    private token.
 3. `OwnerBridge` opens the socket and sends `PUSH{token, payload}` (raw bytes).
 4. Private acks (`PUSH_ACK`), looks up `token → app`, broadcasts `MESSAGE` to
-   jmap-mail, which decrypts with its Keystore key.
+   the app, which decrypts with its own key.
 
 **Unregister** — private drops the reg and remembers the token in a `deprovision`
 set; on the next owner connection the owner calls `UnifiedPush.unregisterApp` on
@@ -184,7 +183,7 @@ com.tigerlake.unifiedshim
 ## Build & install
 
 Built with the Android SDK at `/opt/android-sdk` (Gradle 8.14.2 / AGP 8.7.3 /
-Kotlin 2.1.0; wrapper copied from the sibling jmap-mail project):
+Kotlin 2.1.0):
 
 ```bash
 ./gradlew :app:assembleRelease
@@ -226,10 +225,11 @@ Setup, **in each profile**:
   comma-separated list of their ports (see [Bridge ports](#bridge-ports)).
 - Distributor profile (private space or work profile): open UnifiedShim, optionally
   set a distinct **Bridge port**, tap **Start distributor service**, then in your UP
-  app (e.g. jmap-mail) pick **UnifiedShim** as the UnifiedPush distributor. Any
-  number of UP apps can register.
-- After adding a new jmap-mail account, **open the owner UnifiedShim once** so it
-  provisions that account's endpoint (the distributor can't wake it).
+  app pick **UnifiedShim** as the UnifiedPush distributor. Any number of UP apps
+  can register.
+- Whenever a UP app creates a new registration (e.g. you add a mail account),
+  **open the owner UnifiedShim once** so it provisions that registration's
+  endpoint (the distributor can't wake it).
 
 Logs: `adb logcat -s ushim`.
 
@@ -249,18 +249,17 @@ Logs: `adb logcat -s ushim`.
   capped at 6h/day on API 35).
 - **Binary-safe end to end.** Payloads are RFC 8291 (aes128gcm) encrypted; the
   `PUSH` frame and `EXTRA_BYTES_MESSAGE` keep them byte-exact, and connector 2.5.0
-  reads them via `getByteArrayExtra`. jmap-mail decrypts with its Keystore key.
-- **First provisioning of a new account needs the owner app opened once** — the
+  reads them via `getByteArrayExtra`. The receiving app decrypts with its own key.
+- **First provisioning of a new registration needs the owner app opened once** — the
   private side can't wake a sleeping owner. Subsequent pushes flow automatically.
 - **Delivery is at-least-once with de-dupe.** Every push is written to the owner's
   durable outbox (`OwnerStore`) *before* any send and removed only on its
   `PUSH_ACK`, so an unreachable private side (locked / rebooting / Android-17 grant
   missing) queues the push instead of dropping it; it flushes on the next
   connection. The private side de-dupes by `msgId`, so a retried push isn't
-  delivered to jmap-mail twice. The premise is the private space stays unlocked,
-  so queuing is the rare case.
+  delivered to the app twice. The premise is the distributor profile stays
+  unlocked, so queuing is the rare case.
 - **A REGISTER is persisted even if the distributor FGS can't start** from the
   background — `RegisterReceiver` writes the pending registration to the store
   directly, so it isn't lost to the background-FGS-start restriction; the owner's
   next reconcile provisions it.
-```
