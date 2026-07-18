@@ -8,11 +8,12 @@ import org.json.JSONObject
 /**
  * Persistent registration table for the distributor side.
  *
- * Keyed by the connector's `token` (one per jmap-mail registration). The endpoint
- * is minted on the owner side by the ntfy app and arrives asynchronously, so a
+ * Keyed by the connector's `token` (one per registration; any number of
+ * UnifiedPush apps, e.g. jmap-mail, can register concurrently). The endpoint is
+ * minted on the owner side by the ntfy app and arrives asynchronously, so a
  * registration sits with `endpoint == null` until then.
  *
- * `deprovision` holds tokens jmap-mail has unregistered but whose ntfy-app
+ * `deprovision` holds tokens an app has unregistered but whose ntfy-app
  * instance the owner hasn't released yet — kept until the owner confirms
  * (`DEPROVISIONED`), because the owner may be asleep when the unregister happens.
  */
@@ -69,7 +70,7 @@ class EndpointStore private constructor(context: Context) {
         return true
     }
 
-    /** jmap-mail unregistered: drop the reg, remember the token to release upstream. */
+    /** App unregistered: drop the reg, remember the token to release upstream. */
     @Synchronized
     fun markDeprovision(token: String): Reg? {
         val reg = byToken.remove(token) ?: return null

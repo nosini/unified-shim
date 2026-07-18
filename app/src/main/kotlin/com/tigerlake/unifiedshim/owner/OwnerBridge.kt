@@ -23,9 +23,16 @@ private const val ACK_TIMEOUT_MS = 5_000L
 /**
  * Owner-side coordinator. The owner shim is an event-driven UnifiedPush
  * *connector* registered with the ntfy app; it never opens its own ntfy
- * connection. Each entry point opens a short-lived connection to the always-up
- * private listener, reconciles the registration snapshot the private side pushes,
- * and streams back endpoints / pushes.
+ * connection. Each entry point opens a short-lived connection to an always-up
+ * distributor listener, reconciles the registration snapshot the distributor
+ * pushes, and streams back endpoints / pushes.
+ *
+ * There may be more than one distributor profile (private space + work profile),
+ * each on its own loopback port. Every token belongs to exactly one distributor;
+ * we learn the mapping from the port whose snapshot the token appears in and
+ * route strictly by it. Token-directed calls open a session to the one owning
+ * port; if the port is not yet known we reconcile across *all* configured ports,
+ * which binds the mapping and flushes.
  *
  * All work is serialized through one lock so sessions never overlap — every call
  * here runs synchronously on a wakeup (broadcast receiver / boot / UI thread off
@@ -39,54 +46,74 @@ object OwnerBridge {
     fun deliver(context: Context, token: String, payload: ByteArray) {
         val msgId = msgIdSeq.incrementAndGet()
         OwnerStore.get(context).enqueue(OwnerStore.PendingPush(msgId, token, payload))
-        withSession(context, default = Unit) { /* flush happens in withSession */ }
+        synchronized(lock) { routeToken(context, token) }
     }
 
     /** A (new) endpoint minted by the ntfy app for one of our instances. */
     fun onEndpoint(context: Context, token: String, endpoint: String) {
         OwnerStore.get(context).putEndpoint(token, endpoint)
-        withSession(context, default = Unit) { session -> session.sendEndpoint(token, endpoint) }
+        synchronized(lock) { routeToken(context, token) { session -> session.sendEndpoint(token, endpoint) } }
     }
 
     /** The ntfy app released one of our instances. */
     fun onUnregistered(context: Context, token: String) {
+        // Resolve the owning port before forget() clears the mapping.
+        val port = OwnerStore.get(context).portFor(token)
         OwnerStore.get(context).forget(token)
-        withSession(context, default = Unit) { session -> session.sendDeprovisioned(token) }
+        synchronized(lock) {
+            if (port != null) runSession(context, port) { session -> session.sendDeprovisioned(token) }
+            else reconcileAllPorts(context)
+        }
     }
 
     /** Manual sync (owner app opened): reconcile pending registrations. */
     fun reconcile(context: Context) {
-        withSession(context, default = Unit) { /* reconcile already ran in withSession */ }
+        synchronized(lock) { reconcileAllPorts(context) }
+    }
+
+    // ---- routing ----
+
+    /** Route a token-directed op: session to its owning port if known, else a full
+     *  reconcile across all ports (which binds the mapping and flushes). Caller
+     *  holds [lock]. */
+    private inline fun routeToken(context: Context, token: String, crossinline block: (Session) -> Unit = {}) {
+        val port = OwnerStore.get(context).portFor(token)
+        if (port != null) runSession(context, port) { block(it) }
+        else reconcileAllPorts(context)
+    }
+
+    /** Open one session per configured distributor port, sequentially. Caller holds
+     *  [lock] so the single-session invariant still holds across the whole sweep. */
+    private fun reconcileAllPorts(context: Context) {
+        for (port in Config(context).ownerBridgePorts) runSession(context, port)
     }
 
     // ---- session machinery ----
 
-    private inline fun <T> withSession(context: Context, default: T, block: (Session) -> T): T {
-        synchronized(lock) {
-            val session = openSession(context) ?: return default
-            try {
-                val gotSnapshot = session.regsLatch.await(REGS_TIMEOUT_MS, TimeUnit.MILLISECONDS)
-                if (gotSnapshot) {
-                    session.registrations?.let { applyReconcile(context, session, it) }
-                } else {
-                    Logx.w("owner", "no registration snapshot within ${REGS_TIMEOUT_MS}ms; skipping reconcile this session")
-                }
-                flushOutbox(context, session)
-                return block(session)
-            } finally {
-                session.close()
+    private inline fun runSession(context: Context, port: Int, block: (Session) -> Unit = {}) {
+        val session = openSession(context, port) ?: return
+        try {
+            val gotSnapshot = session.regsLatch.await(REGS_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+            if (gotSnapshot) {
+                session.registrations?.let { applyReconcile(context, session, port, it) }
+            } else {
+                Logx.w("owner", "no registration snapshot from :$port within ${REGS_TIMEOUT_MS}ms; skipping reconcile this session")
             }
+            flushOutbox(context, session, port)
+            block(session)
+        } finally {
+            session.close()
         }
     }
 
-    private fun openSession(context: Context): Session? {
+    private fun openSession(context: Context, port: Int): Session? {
         val session = Session()
-        val link = LoopbackClient.connectOnce(context, Config.BRIDGE_PORT, session::onFrame, session::onClosed)
+        val link = LoopbackClient.connectOnce(context, port, session::onFrame, session::onClosed)
             ?: return null
         session.link = link
         link.send(Protocol.hello(Role.OWNER.name, Process.myUid() % 100_000, Process.myUid() / 100_000))
         if (!session.helloAck.await(HELLO_TIMEOUT_MS, TimeUnit.MILLISECONDS) || !session.ok) {
-            Logx.w("owner", "handshake failed")
+            Logx.w("owner", "handshake failed on :$port")
             link.close()
             return null
         }
@@ -94,20 +121,25 @@ object OwnerBridge {
     }
 
     /**
-     * React to the private side's snapshot: register unknown tokens with the ntfy
-     * app (their endpoints arrive later via onNewEndpoint), re-send endpoints we
-     * already know, release deprovisioned tokens, and flush any queued pushes.
+     * React to a distributor's snapshot: bind every token in it to this port,
+     * register unknown tokens with the ntfy app (their endpoints arrive later via
+     * onNewEndpoint), re-send endpoints we already know, release deprovisioned
+     * tokens, and flush any queued pushes. The snapshot is naturally port-scoped,
+     * so endpoint re-sends and deprovisions here only touch this port's tokens.
      */
-    private fun applyReconcile(context: Context, session: Session, regs: Protocol.Registrations) {
+    private fun applyReconcile(context: Context, session: Session, port: Int, regs: Protocol.Registrations) {
         val store = OwnerStore.get(context)
         val distributorReady = UnifiedPush.getSavedDistributor(context) != null
 
         for (token in regs.active) {
+            // Bind the token to the port that owns it (covers both already-known and
+            // newly registered tokens) so the outbox flush routes it correctly.
+            store.bindPort(token, port)
             val endpoint = store.endpointFor(token)
             if (endpoint != null) {
                 session.sendEndpoint(token, endpoint)
             } else if (distributorReady) {
-                Logx.i("owner", "registering instance with ntfy app for token=$token")
+                Logx.i("owner", "registering instance with ntfy app for token=$token (:$port)")
                 UnifiedPush.registerApp(context, token)
             } else {
                 Logx.w("owner", "no ntfy distributor selected; cannot provision token=$token")
@@ -120,12 +152,20 @@ object OwnerBridge {
         }
     }
 
-    /** Send queued pushes on the live link, removing each only when acked. Abort on
-     *  the first failure/closed link so a dead link can't burn one timeout per item. */
-    private fun flushOutbox(context: Context, session: Session) {
+    /**
+     * Send queued pushes on the live link, removing each only when acked. Abort on
+     * the first failure/closed link so a dead link can't burn one timeout per item.
+     *
+     * Only pushes whose token maps to *this* session's port are sent. A distributor
+     * acks-and-drops pushes for unknown tokens, so flushing a push to the wrong
+     * port would falsely ack and permanently lose it — a push whose token is
+     * unmapped or owned by another port stays queued.
+     */
+    private fun flushOutbox(context: Context, session: Session, port: Int) {
         val store = OwnerStore.get(context)
         for (p in store.peekPending()) {
             if (!session.link.isOpen) break
+            if (store.portFor(p.token) != port) continue
             if (session.sendPushAndAwait(p.msgId, p.token, p.payload)) store.removePending(p.msgId)
             else break
         }

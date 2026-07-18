@@ -1,18 +1,21 @@
 # UnifiedShim
 
-A standalone **cross-profile UnifiedPush bridge**. One APK, installed in two
-Android profiles, behaves differently per profile:
+A standalone **cross-profile UnifiedPush bridge**. One APK, installed in two (or
+more) Android profiles, behaves differently per profile:
 
-- **Private space** → acts as a standard **UnifiedPush distributor**. Your
-  unmodified UP app (jmap-mail) picks it from the normal distributor picker.
+- **Any non-owner profile** (private space *or* work profile) → acts as a standard
+  **UnifiedPush distributor**. Any unmodified UP app (e.g. jmap-mail) picks it from
+  the normal distributor picker. Multiple UP apps can register concurrently.
 - **Owner profile** → a UnifiedPush **connector** registered with the **ntfy
   app**. It never opens its own connection to ntfy — the ntfy app holds the only
   radio. When the ntfy app receives a push it wakes the owner shim, which forwards
   inward over a localhost socket.
 
-The two instances talk over **TCP loopback** (`127.0.0.1:28472`) across the
+The instances talk over **TCP loopback** (default `127.0.0.1:28472`) across the
 device's shared network namespace, authenticated by a mutual HMAC handshake keyed
-by the app's signing certificate.
+by the app's signing certificate. Two distributor profiles share the loopback
+netns, so each binds a **distinct, user-configurable port** (see
+[Bridge ports](#bridge-ports)) and the owner is told the full set.
 
 > Abstract-namespace unix sockets were the first choice but are **SELinux-blocked
 > cross-profile** (the MLS category pair encodes the userId, so `untrusted_app` in
@@ -21,39 +24,46 @@ by the app's signing certificate.
 > subject to that per-peer MAC, so it crosses the shared netns. The cost is losing
 > `SO_PEERCRED`, replaced by the cert-keyed handshake (see `transport/Auth.kt`).
 
-The point: keep push working in the private space **without any persistent radio
-connection there**. The owner profile already runs the ntfy app (its radio +
+The point: keep push working in the distributor profile **without any persistent
+radio connection there**. The owner profile already runs the ntfy app (its radio +
 foreground service); we add nothing persistent on either the owner radio path or
-the private space beyond the listener. jmap-mail is **not modified**.
+the distributor profile beyond the listener. The UP app (jmap-mail) is **not
+modified**.
 
 ---
 
 ## Roles
 
 ```
-OWNER PROFILE (user 0)                              PRIVATE SPACE (userN, unlocked)
-──────────────────────────────────                 ───────────────────────────────
-[ntfy app]  ── wss ──► ntfy.sh  (the only radio)    DistributorService (FGS, always up)
-   │ UnifiedPush MESSAGE/NEW_ENDPOINT broadcast       LoopbackServer  (127.0.0.1:28472)
-   ▼                                                  DistributorController
-OwnerPushReceiver (our connector, woken on demand)    EndpointStore
-   │ OwnerBridge: one-shot loopback connect           AppMessenger ─► UP broadcasts
-   └──── loopback TCP over shared netns (HMAC auth) ──► jmap-mail (unmodified UP app)
+OWNER PROFILE (user 0)                              DISTRIBUTOR PROFILE (private space
+──────────────────────────────────                  OR work profile; userN, unlocked)
+[ntfy app]  ── wss ──► ntfy.sh  (the only radio)    ─────────────────────────────────
+   │ UnifiedPush MESSAGE/NEW_ENDPOINT broadcast     DistributorService (FGS, always up)
+   ▼                                                  LoopbackServer  (127.0.0.1:<port>)
+OwnerPushReceiver (our connector, woken on demand)    DistributorController
+   │ OwnerBridge: one-shot loopback connect           EndpointStore
+   │             (one per distributor port,           AppMessenger ─► UP broadcasts
+   │              routed strictly by token)
+   └──── loopback TCP over shared netns (HMAC auth) ──► jmap-mail (any unmodified UP app)
 ```
 
-- **Private listens and stays foregrounded** — it can't be woken cross-profile,
-  so its FGS keeps the listener bound.
+- **The distributor listens and stays foregrounded** — it can't be woken
+  cross-profile, so its FGS keeps the listener bound.
 - **Owner is event-driven** — no foreground service, no websocket. It is woken by
   the ntfy app's UnifiedPush broadcasts (and by the user opening the app), opens a
-  short-lived socket connection, does its business, and closes.
+  short-lived socket connection, does its business, and closes. With more than one
+  distributor profile it opens one session per configured port, sequentially under
+  a single lock, and routes every token to the port whose snapshot it appeared in.
 - **Role detection** (`role/RoleDetector.kt`): owner/system user has profile
-  serial 0 → `OWNER`; anything else → `PRIVATE`. Override via `Config.forcedRole`.
+  serial 0 → `OWNER`; **any** other profile (private space *or* work profile) →
+  `PRIVATE` (distributor). Override via `Config.forcedRole` (there's a role-cycle
+  button in the UI for unusual profile setups).
 - **Components are role-gated at startup** (`App.onCreate` →
   `setComponentEnabledSetting`): the distributor stack (`RegisterReceiver`,
   `LinkActivity`, `DistributorService`) is disabled in the owner profile and the
-  connector (`OwnerPushReceiver`) in the private profile. So the wrong-profile
-  stack can't be triggered — e.g. a stray `REGISTER` can't start a second
-  listener that contends for `:28472` in the owner profile.
+  connector (`OwnerPushReceiver`) in every distributor profile. So the
+  wrong-profile stack can't be triggered — e.g. a stray `REGISTER` can't start a
+  second listener that contends for the bridge port in the owner profile.
 
 ---
 
@@ -93,7 +103,8 @@ the ntfy app and confirms with `DEPROVISIONED`.
 
 ## Bridge protocol
 
-TCP loopback `127.0.0.1:28472` (`Config.BRIDGE_PORT`, identical both profiles).
+TCP loopback `127.0.0.1:<port>` (default `Config.BRIDGE_PORT` = 28472; each
+distributor profile binds its own port — see [Bridge ports](#bridge-ports)).
 Before the framed protocol runs, a mutual challenge-response (`transport/Auth.kt`)
 proves both ends possess a key derived from the app's signing certificate — both
 profiles are the same signed APK. This replaces `SO_PEERCRED` (TCP has no peer
@@ -118,6 +129,34 @@ reconciliation-based rather than request/response (the owner can't be polled).
 
 ---
 
+## Bridge ports
+
+Every distributor profile binds a loopback port, but all profiles share the
+device's single loopback netns — so two distributor profiles (private space **and**
+a work profile) **cannot both bind the default `28472`**. Give each a distinct
+port and tell the owner about all of them:
+
+1. In **each distributor profile** (UnifiedShim → PRIVATE role screen): set a
+   **distinct** *Bridge port* (e.g. `28472` in the private space, `28473` in the
+   work profile) and tap **Apply port**. If the service is already running it
+   restarts to rebind. Valid range `1024..65535`.
+2. In the **owner profile** (UnifiedShim → OWNER role screen): enter the
+   **comma-separated list** of every distributor port (e.g. `28472,28473`) in
+   *Distributor ports* and tap **Apply ports**.
+
+The owner opens one short-lived session per port on each wakeup and routes strictly
+by token: it learns `token → port` from whichever port's `REGISTRATIONS` snapshot a
+token appears in, and only ever flushes a queued push to the port that owns its
+token. (A distributor acks-and-drops pushes for unknown tokens, so sending a push to
+the wrong port would falsely ack and permanently lose it — hence the strict
+routing.) A single distributor profile needs no configuration; the defaults
+(`28472` / `[28472]`) just work.
+
+Persisted in `Config` (`bridgePort`, `ownerBridgePorts`) and, on the owner, the
+`token → port` map in `OwnerStore`.
+
+---
+
 ## Module / package layout
 
 Single `:app` module; the **`transport/` package is the isolation seam** — both
@@ -133,11 +172,11 @@ com.tigerlake.unifiedshim
 │   ├── Auth       (cert-keyed mutual HMAC handshake)
 │   ├── BridgeLink (stream-based, transport-agnostic)
 │   └── loopback/  LoopbackServer (private), LoopbackClient (owner one-shot)
-├── distributor/   (private role) RegisterReceiver, LinkActivity, DistributorService,
+├── distributor/   (distributor role) RegisterReceiver, LinkActivity, DistributorService,
 │                   DistributorController, EndpointStore, AppMessenger, UnifiedPush
 ├── owner/         (owner role) OwnerPushReceiver (UP connector), OwnerBridge, OwnerStore
-├── boot/          BootReceiver (starts the private FGS; owner needs nothing)
-└── ui/            MainActivity (status + distributor picker + manual sync)
+├── boot/          BootReceiver (starts the distributor FGS; owner needs nothing)
+└── ui/            MainActivity (status + role/port config + distributor picker + manual sync)
 ```
 
 ---
@@ -182,11 +221,15 @@ Inter Profile Sharing app uses for the same OS change.
 
 Setup, **in each profile**:
 - Owner: install the **ntfy app**, point it at your ntfy server, then open
-  UnifiedShim and tap **Use: io.heckel.ntfy** to select it as distributor.
-- Private: open UnifiedShim, tap **Start distributor service**, then in jmap-mail
-  pick **UnifiedShim** as the UnifiedPush distributor.
+  UnifiedShim and tap **Use: io.heckel.ntfy** to select it as distributor. If you
+  run more than one distributor profile, set **Distributor ports** to the
+  comma-separated list of their ports (see [Bridge ports](#bridge-ports)).
+- Distributor profile (private space or work profile): open UnifiedShim, optionally
+  set a distinct **Bridge port**, tap **Start distributor service**, then in your UP
+  app (e.g. jmap-mail) pick **UnifiedShim** as the UnifiedPush distributor. Any
+  number of UP apps can register.
 - After adding a new jmap-mail account, **open the owner UnifiedShim once** so it
-  provisions that account's endpoint (the private side can't wake it).
+  provisions that account's endpoint (the distributor can't wake it).
 
 Logs: `adb logcat -s ushim`.
 

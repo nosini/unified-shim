@@ -32,10 +32,13 @@ class DistributorService : Service() {
             ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE,
         )
 
+        running = true
         controller = DistributorController(EndpointStore.get(this), AppMessenger(this))
+        val port = Config(this).bridgePort
+        Logx.i("dist", "binding loopback listener on :$port")
         server = LoopbackServer(
             context = this,
-            port = Config.BRIDGE_PORT,
+            port = port,
             onFrame = { frame, link -> onServerFrame(frame, link) },
             // The owner connects per push and disconnects — link up/down is normal
             // and frequent, so we keep the notification text stable rather than flap.
@@ -86,6 +89,7 @@ class DistributorService : Service() {
     }
 
     override fun onDestroy() {
+        running = false
         server.stop()
         super.onDestroy()
     }
@@ -93,8 +97,19 @@ class DistributorService : Service() {
     override fun onBind(intent: Intent?): IBinder? = null
 
     companion object {
+        /** Best-effort: whether the FGS is currently up in this process, so the UI
+         *  can decide whether a port change needs a restart. */
+        @Volatile var running = false
+            private set
+
         fun ensureStarted(context: Context) {
             context.startForegroundService(Intent(context, DistributorService::class.java))
+        }
+
+        /** Stop then re-start so the listener rebinds on a newly configured port. */
+        fun restart(context: Context) {
+            context.stopService(Intent(context, DistributorService::class.java))
+            ensureStarted(context)
         }
     }
 }

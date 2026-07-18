@@ -90,7 +90,7 @@ class DistributorController(
     }
 
     private fun handleDeprovisioned(token: String) {
-        // Case (b): ntfy released an instance jmap-mail still wants -> reset to
+        // Case (b): ntfy released an instance the registered app still wants -> reset to
         // pending so the next owner reconcile re-registers and a fresh NEW_ENDPOINT
         // reaches the app. Case (a): a genuine unregister confirmation -> clear it.
         if (store.resetToPending(token)) {
@@ -121,7 +121,7 @@ class DistributorController(
         }
         val reg = store.byToken(push.token)
         if (reg == null) {
-            // Undeliverable (jmap-mail not/no-longer registered). Ack anyway so the
+            // Undeliverable (that app not/no-longer registered). Ack anyway so the
             // owner drops it instead of retrying forever.
             Logx.w("dist", "push for unknown token=${push.token}")
             l.send(Protocol.pushAck(push.msgId))
