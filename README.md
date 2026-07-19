@@ -291,10 +291,37 @@ adb shell pm grant --user 10 com.tigerlake.unifiedshim android.permission.INTERA
 adb shell am force-stop --user 10 com.tigerlake.unifiedshim
 ```
 
-(Use your private-space user id from `pm list users` in place of `10`.) On Android
-16 and earlier this isn't needed — loopback crosses profiles freely. The owner
-status screen prints the exact command on Android 17+. Same mechanism the
-Inter Profile Sharing app uses for the same OS change.
+(Use your profile user ids from `pm list users` in place of `10`.) On Android
+16 and earlier this isn't needed — loopback crosses profiles freely. On Android
+17+ the status screen shows the per-profile grant state (`INTERACT_ACROSS_USERS:
+granted` / `MISSING — bridge blocked!` with the exact command), and the loopback
+client logs a hint when a connect fails while the grant is missing — the gate
+drops packets silently, so a bare connect timeout is otherwise indistinguishable
+from a dead listener. Same mechanism the Inter Profile Sharing app uses for the
+same OS change.
+
+#### Managed work profiles (Shelter): `no_debugging_features`
+
+The grant itself can fail with
+`SecurityException: Shell does not have permission to access user N`. That is not
+about the permission — shell is locked out of the profile entirely by the
+`no_debugging_features` restriction (`DISALLOW_DEBUGGING_FEATURES`; verify under
+"Device policy restrictions" in `adb shell dumpsys user`). Managed provisioning
+sets it on work profiles by default and Shelter, as profile owner, never clears
+it. Shelter's cross-profile toggles (intents/contacts/file shuttle) are unrelated
+and don't help. Ways out:
+
+- **Root** — a root shell bypasses the shell-user check:
+  `adb shell su -c 'pm grant --user N com.tigerlake.unifiedshim android.permission.INTERACT_ACROSS_USERS'`
+- **Island** instead of Shelter — it permits debugging inside its profile, so the
+  normal `pm grant --user N` works.
+- **A custom/forked profile owner** that calls
+  `DevicePolicyManager.clearUserRestriction(DISALLOW_DEBUGGING_FEATURES)`. The
+  owner app of an existing profile can't be swapped (different signer), so this
+  means re-provisioning the profile.
+
+Without one of these, a restricted work profile cannot join the bridge on
+Android 17+ (all other profiles are unaffected).
 
 Setup, **in each profile** — no port configuration anywhere:
 - Owner: install the **ntfy app**, point it at your ntfy server, then open

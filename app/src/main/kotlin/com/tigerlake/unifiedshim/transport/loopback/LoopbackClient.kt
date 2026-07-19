@@ -1,6 +1,8 @@
 package com.tigerlake.unifiedshim.transport.loopback
 
 import android.content.Context
+import android.content.pm.PackageManager
+import com.tigerlake.unifiedshim.common.Config
 import com.tigerlake.unifiedshim.common.Logx
 import com.tigerlake.unifiedshim.transport.Auth
 import com.tigerlake.unifiedshim.transport.BridgeLink
@@ -42,6 +44,13 @@ object LoopbackClient {
             BridgeLink(input, output, sock, "127.0.0.1:$port", onFrame, onClosed).also { it.start() }
         } catch (e: Exception) {
             Logx.d("client", "connect failed: ${e.message}")
+            // A cross-profile connect on Android 17+ without the grant times out
+            // silently — surface the actual cause instead of a bare timeout.
+            if (android.os.Build.VERSION.SDK_INT >= 37 &&
+                context.checkSelfPermission(Config.PERM_INTERACT_ACROSS_USERS) != PackageManager.PERMISSION_GRANTED
+            ) {
+                Logx.w("client", "INTERACT_ACROSS_USERS not granted in this profile — Android 17+ blocks cross-profile loopback (see README)")
+            }
             runCatching { sock.close() }
             null
         }

@@ -106,6 +106,10 @@ class Config(context: Context) {
         /** Valid TCP port range for a user-configured bridge port. */
         val PORT_RANGE = 1024..65535
 
+        /** Gates cross-profile loopback on Android 17+ (API 37). Not in the public
+         *  Manifest.permission class, hence the string literal. */
+        const val PERM_INTERACT_ACROSS_USERS = "android.permission.INTERACT_ACROSS_USERS"
+
         /**
          * Default TCP loopback port for the cross-profile bridge. Loopback (not an
          * abstract unix socket) because SELinux MLS blocks cross-profile unix

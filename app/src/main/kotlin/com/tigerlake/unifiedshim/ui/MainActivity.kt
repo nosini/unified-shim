@@ -190,9 +190,16 @@ class MainActivity : Activity() {
         // Android 17 (API 37) gates cross-profile loopback behind INTERACT_ACROSS_USERS.
         if (android.os.Build.VERSION.SDK_INT >= 37) {
             appendLine()
-            appendLine("Android 17+: if the bridge can't connect, grant via ADB:")
-            appendLine("  pm grant --user ${Process.myUid() / 100_000} $packageName \\")
-            appendLine("    android.permission.INTERACT_ACROSS_USERS")
+            val user = Process.myUid() / 100_000
+            if (checkSelfPermission(Config.PERM_INTERACT_ACROSS_USERS) == PackageManager.PERMISSION_GRANTED) {
+                appendLine("INTERACT_ACROSS_USERS: granted")
+            } else {
+                appendLine("INTERACT_ACROSS_USERS: MISSING — bridge blocked!")
+                appendLine("Grant via ADB, then restart the app:")
+                appendLine("  pm grant --user $user $packageName \\")
+                appendLine("    android.permission.INTERACT_ACROSS_USERS")
+                appendLine("If that fails with \"Shell does not have permission to access user $user\", the profile owner sets no_debugging_features (e.g. Shelter work profiles) — see README.")
+            }
         }
         appendLine()
         when (role) {
