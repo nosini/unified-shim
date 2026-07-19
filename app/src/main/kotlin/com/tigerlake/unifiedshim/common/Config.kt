@@ -19,9 +19,11 @@ class Config(context: Context) {
         }.apply()
 
     /**
-     * Distributor-side loopback port this profile binds. Two distributor profiles
-     * (private space + work profile) share the device's loopback netns and can't
-     * both bind the same port, so each is configured with a distinct one.
+     * Distributor-side loopback port this profile last bound. Two distributor
+     * profiles (private space + work profile) share the device's loopback netns and
+     * can't both bind the same port; port assignment is now automatic (the listener
+     * walks [PORT_SCAN_RANGE] and binds the first free port), and this persists the
+     * result so each profile reclaims its port across reboots.
      */
     var bridgePort: Int
         get() = prefs.getInt(KEY_BRIDGE_PORT, BRIDGE_PORT).takeIf { it in PORT_RANGE } ?: BRIDGE_PORT
@@ -69,6 +71,31 @@ class Config(context: Context) {
         set(v) = prefs.edit().putInt(KEY_OWNER_NUDGE_PORT, v).apply()
 
     companion object {
+        /** Single lock guarding every read-modify-write of [ownerBridgePorts] (see
+         *  [addOwnerBridgePort]). Distinct learners race here — NUDGE reader threads
+         *  and OwnerBridge scan sessions — so all growth of the list goes through this
+         *  one lock. The plain [ownerBridgePorts] setter is only invoked from inside
+         *  [addOwnerBridgePort] (under this lock), so there is no unguarded writer. */
+        private val ownerPortsLock = Any()
+
+        /**
+         * Learn a distributor port: add [port] to [ownerBridgePorts] if absent. The
+         * only writer of the list, so the read-modify-write can't lose a concurrent
+         * learn. Called by the NUDGE handler (announced port) and by OwnerBridge after
+         * a successful scan handshake (discovered port). Stale learned ports are never
+         * pruned — a moved distributor just fast-fails on connect each sweep.
+         */
+        fun addOwnerBridgePort(context: Context, port: Int) {
+            if (port !in PORT_RANGE) return
+            synchronized(ownerPortsLock) {
+                val cfg = Config(context)
+                if (port !in cfg.ownerBridgePorts) {
+                    cfg.ownerBridgePorts = cfg.ownerBridgePorts + port
+                    Logx.i("cfg", "learned distributor port :$port")
+                }
+            }
+        }
+
         private const val KEY_FORCED_ROLE = "forced_role"
         private const val KEY_BRIDGE_PORT = "bridge_port"
         private const val KEY_OWNER_PORTS = "owner_bridge_ports"
@@ -87,6 +114,15 @@ class Config(context: Context) {
          * can coexist.
          */
         const val BRIDGE_PORT = 28472
+
+        /**
+         * Default candidate range a distributor listener walks to auto-assign its
+         * port. All profiles share one loopback netns, so a profile that fails to bind
+         * a candidate (already taken) simply tries the next — the kernel is the
+         * port-conflict arbiter. The owner scans this same range as the announce
+         * fallback.
+         */
+        val PORT_SCAN_RANGE = BRIDGE_PORT..BRIDGE_PORT + 7
 
         /** Default port for the optional owner auto-provision listener (and thus the
          *  default distributor nudge target). Distinct from [BRIDGE_PORT] so the owner

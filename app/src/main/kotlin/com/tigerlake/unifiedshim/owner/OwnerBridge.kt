@@ -88,24 +88,39 @@ object OwnerBridge {
         else reconcileAllPorts(context)
     }
 
-    /** Open one session per configured distributor port, sequentially. Caller holds
-     *  [lock] so the single-session invariant still holds across the whole sweep. */
+    /**
+     * Sweep every candidate distributor port sequentially: the learned ports plus the
+     * default scan range (announces can be missed — owner app closed, FGS off — so we
+     * also scan). Excludes the owner's own listener port so we never dial ourselves.
+     * Dead ports fast-fail on connect (loopback refusal is immediate) — [openSession]
+     * returns null and [runSession] returns, which is the skip path. Caller holds
+     * [lock] so the single-session invariant holds across the whole sweep.
+     */
     private fun reconcileAllPorts(context: Context) {
-        for (port in Config(context).ownerBridgePorts) runSession(context, port)
+        val ownerListenerPort = Config(context).ownerListenerPort
+        val ports = (Config(context).ownerBridgePorts + Config.PORT_SCAN_RANGE).distinct() - ownerListenerPort
+        for (port in ports) runSession(context, port)
     }
 
     // ---- session machinery ----
 
     private inline fun runSession(context: Context, port: Int, block: (Session) -> Unit = {}) {
         val session = openSession(context, port) ?: return
+        // Handshake succeeded → a real, signed distributor lives on this port; learn
+        // it so later reconciles dial it directly even if we found it only by scanning.
+        Config.addOwnerBridgePort(context, port)
         try {
             val gotSnapshot = session.regsLatch.await(REGS_TIMEOUT_MS, TimeUnit.MILLISECONDS)
-            if (gotSnapshot) {
-                session.registrations?.let { applyReconcile(context, session, port, it) }
+            val regs = if (gotSnapshot) session.registrations else null
+            if (regs != null) {
+                applyReconcile(context, session, port, regs)
             } else {
-                Logx.w("owner", "no registration snapshot from :$port within ${REGS_TIMEOUT_MS}ms; skipping reconcile this session")
+                Logx.w("owner", "no registration snapshot from :$port within ${REGS_TIMEOUT_MS}ms; skipping reconcile+flush this session")
             }
-            flushOutbox(context, session, port)
+            // Ground truth for what THIS distributor owns is its snapshot, not the
+            // token→port map — so flush only tokens in regs.active, and nothing at all
+            // without a snapshot (see [flushOutbox]).
+            flushOutbox(context, session, regs?.active?.toSet() ?: emptySet())
             block(session)
         } finally {
             session.close()
@@ -162,16 +177,21 @@ object OwnerBridge {
      * Send queued pushes on the live link, removing each only when acked. Abort on
      * the first failure/closed link so a dead link can't burn one timeout per item.
      *
-     * Only pushes whose token maps to *this* session's port are sent. A distributor
-     * acks-and-drops pushes for unknown tokens, so flushing a push to the wrong
-     * port would falsely ack and permanently lose it — a push whose token is
-     * unmapped or owned by another port stays queued.
+     * Correctness is gated by snapshot membership, NOT the token→port map: only tokens
+     * in [activeTokens] (this session's `REGISTRATIONS.active`) are flushed, and if no
+     * snapshot arrived [activeTokens] is empty so nothing is flushed. With
+     * auto-assigned ports a remembered port can be re-occupied by a *different*
+     * distributor profile (first-boot race before persistence, or a foreign app
+     * squatting a port forcing a move), and the map might still point a token here. A
+     * distributor acks-and-drops unknown tokens, so a mis-flush would falsely ack and
+     * permanently lose the push. The snapshot is the only ground truth for what this
+     * distributor actually owns.
      */
-    private fun flushOutbox(context: Context, session: Session, port: Int) {
+    private fun flushOutbox(context: Context, session: Session, activeTokens: Set<String>) {
         val store = OwnerStore.get(context)
         for (p in store.peekPending()) {
             if (!session.link.isOpen) break
-            if (store.portFor(p.token) != port) continue
+            if (p.token !in activeTokens) continue
             if (session.sendPushAndAwait(p.msgId, p.token, p.payload)) store.removePending(p.msgId)
             else break
         }

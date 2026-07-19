@@ -14,8 +14,8 @@ more) Android profiles, behaves differently per profile:
 The instances talk over **TCP loopback** (default `127.0.0.1:28472`) across the
 device's shared network namespace, authenticated by a mutual HMAC handshake keyed
 by the app's signing certificate. Two distributor profiles share the loopback
-netns, so each binds a **distinct, user-configurable port** (see
-[Bridge ports](#bridge-ports)) and the owner is told the full set.
+netns, so each auto-assigns a **distinct port** by walking a small default range —
+no configuration anywhere (see [Port auto-discovery](#port-auto-discovery)).
 
 > Abstract-namespace unix sockets were the first choice but are **SELinux-blocked
 > cross-profile** (the MLS category pair encodes the userId, so `untrusted_app` in
@@ -48,12 +48,15 @@ OwnerPushReceiver (our connector, woken on demand)    DistributorController
 
 - **The distributor listens and stays foregrounded** — it can't be woken
   cross-profile, so its FGS keeps the listener bound.
-- **Owner is event-driven** — no foreground service, no websocket (unless the
-  optional [auto-provision](#auto-provision-optional) listener is enabled). It is
-  woken by the ntfy app's UnifiedPush broadcasts (and by the user opening the app),
-  opens a short-lived socket connection, does its business, and closes. With more than one
-  distributor profile it opens one session per configured port, sequentially under
-  a single lock, and routes every token to the port whose snapshot it appeared in.
+- **Owner is event-driven** — no foreground service, no websocket. It is woken by
+  the ntfy app's UnifiedPush broadcasts (and by the user opening the app), opens a
+  short-lived socket connection, does its business, and closes. It reconciles the
+  learned distributor ports **plus the default scan range**, one session per port
+  sequentially under a single lock, and routes every token to the port whose
+  snapshot it appeared in. A [nudge listener](#port-auto-discovery) also runs while
+  the owner app is open (and, optionally, always-on via
+  [auto-provision](#auto-provision-optional)) so a distributor's announce lands
+  immediately.
 - **Role detection** (`role/RoleDetector.kt`): owner/system user has profile
   serial 0 → `OWNER`; **any** other profile (private space *or* work profile) →
   `PRIVATE` (distributor). Override via `Config.forcedRole` (there's a role-cycle
@@ -107,7 +110,8 @@ the ntfy app and confirms with `DEPROVISIONED`.
 ## Bridge protocol
 
 TCP loopback `127.0.0.1:<port>` (default `Config.BRIDGE_PORT` = 28472; each
-distributor profile binds its own port — see [Bridge ports](#bridge-ports)).
+distributor profile auto-assigns its own port — see
+[Port auto-discovery](#port-auto-discovery)).
 Before the framed protocol runs, a mutual challenge-response (`transport/Auth.kt`)
 proves both ends possess a key derived from the app's signing certificate — both
 profiles are the same signed APK. This replaces `SO_PEERCRED` (TCP has no peer
@@ -125,7 +129,7 @@ Frame: `[int32 length][byte type][body]`. Control/handshake bodies are UTF-8 JSO
 | `DEPROVISIONED` 0x12 | owner→priv | JSON `{token}` |
 | `PUSH` 0x20 | owner→priv | `[int64 msgId][int16 tokenLen][token][payload]` |
 | `PUSH_ACK` 0x21 | priv→owner | JSON `{msgId}` |
-| `NUDGE` 0x30 | priv→owner | JSON `{port}` — flows on the **owner's** [auto-provision](#auto-provision-optional) listener (not the distributor listener); the sender's own bridge port |
+| `NUDGE` 0x30 | priv→owner | JSON `{port}` — flows on the **owner's** [nudge listener](#port-auto-discovery) (not the distributor listener); the sender's own auto-assigned bridge port |
 
 The owner is the client and connects per wakeup; the private side is the server
 and pushes `REGISTRATIONS` immediately after the handshake so the exchange is
@@ -133,77 +137,98 @@ reconciliation-based rather than request/response (the owner can't be polled).
 
 ---
 
-## Bridge ports
+## Port auto-discovery
 
-Every distributor profile binds a loopback port, but all profiles share the
-device's single loopback netns — so two distributor profiles (private space **and**
-a work profile) **cannot both bind the default `28472`**. Give each a distinct
-port and tell the owner about all of them:
+Port assignment is **fully automatic and zero-config** — no port fields anywhere in
+the distributor UI. All profiles share the device's single loopback netns, so two
+distributor profiles (private space **and** a work profile) can't both bind the
+default `28472`; the kernel is the arbiter and the pieces below resolve it:
 
-1. In **each distributor profile** (UnifiedShim → PRIVATE role screen): set a
-   **distinct** *Bridge port* (e.g. `28472` in the private space, `28473` in the
-   work profile) and tap **Apply port**. If the service is already running it
-   restarts to rebind. Valid range `1024..65535`.
-2. In the **owner profile** (UnifiedShim → OWNER role screen): enter the
-   **comma-separated list** of every distributor port (e.g. `28472,28473`) in
-   *Distributor ports* and tap **Apply ports**.
+- **Kernel-arbitrated bind walking.** A distributor listener walks
+  `Config.PORT_SCAN_RANGE` (`28472..28479`) and binds the first free port (bind
+  inside the loop — no pre-probe, no TOCTOU); only after the whole range fails does
+  it back off and retry. It tries its **persisted last-bound port first**, so
+  assignments are **stable across reboots** — each profile reclaims its port and
+  they don't swap when boot order changes. First-ever: the private space gets
+  `28472`, the work profile finds it taken and lands on `28473`, and both persist.
+- **Announce-on-bind.** On every successful bind the distributor announces its port
+  to the owner's [nudge listener](#auto-provision-optional) (`NUDGE` frame, best-effort).
+  That's what tells the owner this profile's current port. The nudge listener now
+  runs whenever the **owner app is open** (no FGS required) — open the owner app,
+  then the distributor binds and announces, and the owner learns the port and
+  reconciles. The optional [auto-provision](#auto-provision-optional) FGS is only for
+  keeping the listener up while the owner app is **closed**.
+- **Scan fallback.** Announces can be missed (owner app closed, FGS off), so the
+  owner's full reconcile also **scans the default range**: it sweeps its learned
+  ports plus `PORT_SCAN_RANGE` (excluding its own listener port so it never dials
+  itself). Dead ports fast-fail on connect (loopback refusal is immediate) and are
+  skipped. A port whose handshake succeeds is learned; stale learned ports (a
+  distributor that moved) are never pruned — they just fast-fail each sweep.
+- **Routing + flush safety.** The owner routes strictly by token: it learns
+  `token → port` from whichever port's `REGISTRATIONS` snapshot a token appears in.
+  With auto-assigned ports a remembered port could in principle be re-occupied by a
+  *different* distributor, so the flush **does not trust the port map** — it flushes
+  a queued push only if the token is in **this session's snapshot** (`regs.active`),
+  and flushes nothing at all if no snapshot arrived. A distributor acks-and-drops
+  unknown tokens, so a mis-flush would falsely ack and permanently lose the push;
+  snapshot membership is the only ground truth for what a distributor owns.
 
-The owner opens one short-lived session per port on each wakeup and routes strictly
-by token: it learns `token → port` from whichever port's `REGISTRATIONS` snapshot a
-token appears in, and only ever flushes a queued push to the port that owns its
-token. (A distributor acks-and-drops pushes for unknown tokens, so sending a push to
-the wrong port would falsely ack and permanently lose it — hence the strict
-routing.) A single distributor profile needs no configuration; the defaults
-(`28472` / `[28472]`) just work.
-
-Persisted in `Config` (`bridgePort`, `ownerBridgePorts`) and, on the owner, the
-`token → port` map in `OwnerStore`.
+Persisted in `Config` (`bridgePort` = last-bound, `ownerBridgePorts` = learned set)
+and, on the owner, the `token → port` map in `OwnerStore`. The one remaining port
+knob is the owner's **listener port** (default `28471`), which must differ from the
+distributor range.
 
 ---
 
 ## Auto-provision (optional)
 
-By default the owner profile runs **nothing persistent** and a brand-new
-registration waits until you open the owner app once (the manual sync). That
-manual step is the price of the "no persistent owner component" property.
+The owner's **nudge listener** (`owner/NudgeListener`) accepts a distributor's
+`NUDGE` announce and reconciles that port immediately — exactly the work `Sync now`
+would do. It runs under a holder-based lifecycle with two possible holders:
 
-**Auto-provision** trades that property for full automation: registrations
-provision **start to finish with no manual sync anywhere**. It is **off by
-default** — turning it on adds an always-on foreground service in the *owner*
-profile (`OwnerListenerService`, a `specialUse` FGS like the distributor's),
-relaxing the "nothing persistent in the owner profile" constraint. That's the
-whole trade-off; the manual-open flow still works and remains the default.
+- **While the owner app is open** (`"activity"` holder) — no persistent component.
+  Open the owner app and a distributor's announce lands with no FGS; this is why
+  first-time provisioning usually needs nothing more than opening both apps once.
+- **Always-on** (`"fgs"` holder) — the optional foreground service
+  `OwnerListenerService` (a `specialUse` FGS), **off by default**, keeps the listener
+  up even while the owner app is **closed**, so registrations provision **start to
+  finish with no manual sync anywhere**. This is the only persistent component in the
+  owner profile; enabling it relaxes the "nothing persistent in the owner profile"
+  property. That's the whole trade-off; the manual-open flow still works and remains
+  the default.
 
-How it works: the owner listener binds its own loopback port. When a registration
-changes (or the distributor service restarts with pending work), the distributor
-opens a one-shot authenticated connection to that port and sends a `NUDGE` frame
-carrying its own bridge port. The owner reconciles that single port immediately —
-exactly the work `Sync now` would do. The nudge fires **only** on registration
-state changes and distributor startup, never in response to owner-initiated
-traffic, so there's no feedback loop. A dead or disabled owner listener is
+Both holders share **one** `LoopbackServer` (refcounted, no double-bind): the server
+starts on the first acquire and stops on the last release, in any overlap order.
+
+How it works: the listener binds its own loopback port. When a distributor binds
+(announce-on-bind) or a registration changes, the distributor opens a one-shot
+authenticated connection to that port and sends a `NUDGE` frame carrying its own
+auto-assigned bridge port. The nudge fires **only** on a successful bind, a
+registration state change (when no owner link is live), and the
+`RegisterReceiver` FGS-start-failure catch — **never** in response to
+owner-initiated traffic, so there's no feedback loop. A dead or disabled listener is
 indistinguishable from manual mode (every nudge is best-effort and swallowed).
 
-The owner **auto-learns distributor ports from nudges**: the auth handshake already
-proves the peer is our own signed APK in another profile, so a nudged port that
-isn't in *Distributor ports* yet is added automatically — no owner-side port config
-needed for a nudging distributor.
+The owner **auto-learns distributor ports**: the auth handshake proves the peer is
+our own signed APK in another profile, so a nudged port (or one discovered by the
+[scan fallback](#port-auto-discovery)) is added to the learned set automatically — no
+owner-side port config. The read-modify-write is centralized in
+`Config.addOwnerBridgePort` under a single lock.
 
-Setup:
-- **Owner** (OWNER screen): tap **Auto-provision listener: OFF** to turn it **ON**.
-  Note the listener port (default `28471`); change it with **Apply listener port**
-  if needed.
-- **Each distributor** (PRIVATE screen): set **Owner port** to the owner's listener
-  port (default `28471`). `0` disables nudging for that profile (manual
-  provisioning).
+Setup: tap **Auto-provision listener: OFF** to turn it **ON** (OWNER screen). Note
+the listener port (default `28471`); change it with **Apply listener port** if
+needed. There is nothing to configure on the distributor side.
 
-The owner listener shares the device's single loopback netns with every
-distributor listener, so its port must be **distinct from every bridge port**
-(the defaults `28471` vs `28472` already are) — a collision leaves whichever
-side binds second stuck retrying.
+The listener shares the device's single loopback netns with every distributor
+listener, so its port must be **distinct from the distributor range**
+(`28471` vs `28472..28479` already is) — a collision leaves whichever side binds
+second stuck retrying.
 
-Persisted in `Config` (`ownerListenerEnabled`, `ownerListenerPort`,
-`ownerNudgePort`). Started from the owner toggle and, on boot, by `BootReceiver`
-when `ownerListenerEnabled`.
+Persisted in `Config` (`ownerListenerEnabled`, `ownerListenerPort`). The FGS is
+started from the owner toggle and, on boot, by `BootReceiver` when
+`ownerListenerEnabled`. (`Config.ownerNudgePort`, the distributor's nudge target,
+has no UI — it defaults to `28471` and is left for power users to override via
+adb/backup.)
 
 ---
 
@@ -221,13 +246,14 @@ com.tigerlake.unifiedshim
 │   ├── protocol/  Frame, Protocol
 │   ├── Auth       (cert-keyed mutual HMAC handshake)
 │   ├── BridgeLink (stream-based, transport-agnostic)
-│   └── loopback/  LoopbackServer (private), LoopbackClient (owner one-shot)
+│   └── loopback/  LoopbackServer (candidate-walking bind), LoopbackClient (owner one-shot)
 ├── distributor/   (distributor role) RegisterReceiver, LinkActivity, DistributorService,
 │                   DistributorController, EndpointStore, AppMessenger, UnifiedPush, OwnerNudger
 ├── owner/         (owner role) OwnerPushReceiver (UP connector), OwnerBridge, OwnerStore,
-│                   OwnerListenerService (optional auto-provision FGS)
+│                   NudgeListener (holder-based nudge listener),
+│                   OwnerListenerService (optional always-on FGS holder)
 ├── boot/          BootReceiver (starts the distributor FGS; owner FGS only if auto-provision on)
-└── ui/            MainActivity (status + role/port config + distributor picker + manual sync)
+└── ui/            MainActivity (status + role config + distributor picker + manual sync)
 ```
 
 ---
@@ -270,18 +296,18 @@ adb shell am force-stop --user 10 com.tigerlake.unifiedshim
 status screen prints the exact command on Android 17+. Same mechanism the
 Inter Profile Sharing app uses for the same OS change.
 
-Setup, **in each profile**:
+Setup, **in each profile** — no port configuration anywhere:
 - Owner: install the **ntfy app**, point it at your ntfy server, then open
-  UnifiedShim and tap **Use: io.heckel.ntfy** to select it as distributor. If you
-  run more than one distributor profile, set **Distributor ports** to the
-  comma-separated list of their ports (see [Bridge ports](#bridge-ports)).
-- Distributor profile (private space or work profile): open UnifiedShim, optionally
-  set a distinct **Bridge port**, tap **Start distributor service**, then in your UP
-  app pick **UnifiedShim** as the UnifiedPush distributor. Any number of UP apps
+  UnifiedShim and tap **Use: io.heckel.ntfy** to select it as distributor. Ports are
+  auto-discovered (see [Port auto-discovery](#port-auto-discovery)).
+- Distributor profile (private space or work profile): open UnifiedShim, tap
+  **Start distributor service**, then in your UP app pick **UnifiedShim** as the
+  UnifiedPush distributor. The listener auto-assigns its port. Any number of UP apps
   can register.
 - Whenever a UP app creates a new registration (e.g. you add a mail account),
   **open the owner UnifiedShim once** so it provisions that registration's
-  endpoint (the distributor can't wake it).
+  endpoint (the distributor can't wake a sleeping owner). With
+  [auto-provision](#auto-provision-optional) on, even this step is automatic.
 
 Logs: `adb logcat -s ushim`.
 

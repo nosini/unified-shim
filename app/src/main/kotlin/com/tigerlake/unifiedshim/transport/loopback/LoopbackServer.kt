@@ -25,10 +25,15 @@ import java.util.concurrent.atomic.AtomicBoolean
  */
 class LoopbackServer(
     private val context: Context,
-    private val port: Int,
+    // Ports to try, in order, on each bind attempt. All profiles share one loopback
+    // netns, so a candidate already held by another profile just fails and we walk to
+    // the next — the kernel arbitrates. Evaluated fresh per attempt so the persisted
+    // last-bound port can lead the list. A single-element list = fixed-port behavior.
+    private val candidates: () -> List<Int>,
     private val onFrame: (Frame, BridgeLink) -> Unit,
     private val onLink: (BridgeLink) -> Unit,
     private val onLinkClosed: (BridgeLink) -> Unit,
+    private val onBound: (Int) -> Unit = {},
 ) {
     private val running = AtomicBoolean(false)
     @Volatile private var serverSocket: ServerSocket? = null
@@ -41,21 +46,35 @@ class LoopbackServer(
     private fun bindAndAccept() {
         var backoff = MIN_REBIND_DELAY
         while (running.get()) {
-            val ss = try {
-                ServerSocket(port, BACKLOG, InetAddress.getByName("127.0.0.1"))
-            } catch (e: Exception) {
-                Logx.w("server", "bind 127.0.0.1:$port failed: ${e.message}; retry in ${backoff}ms")
+            val ss = bindFirstFree()
+            if (ss == null) {
+                // Whole candidate list was taken (or errored) — back off, then retry.
+                Logx.w("server", "no candidate port free; retry in ${backoff}ms")
                 sleep(backoff)
                 backoff = (backoff * 2).coerceAtMost(MAX_REBIND_DELAY)
                 continue
             }
             backoff = MIN_REBIND_DELAY
             serverSocket = ss
-            Logx.i("server", "listening on 127.0.0.1:$port")
+            val boundPort = ss.localPort
+            Logx.i("server", "listening on 127.0.0.1:$boundPort")
+            onBound(boundPort)
             acceptLoop(ss)
             runCatching { ss.close() }
         }
         Logx.i("server", "accept loop ended")
+    }
+
+    /** Bind the first free candidate (bind inside the loop — no pre-probe, no TOCTOU). */
+    private fun bindFirstFree(): ServerSocket? {
+        for (port in candidates()) {
+            try {
+                return ServerSocket(port, BACKLOG, InetAddress.getByName("127.0.0.1"))
+            } catch (e: Exception) {
+                Logx.d("server", "bind 127.0.0.1:$port failed: ${e.message}; next candidate")
+            }
+        }
+        return null
     }
 
     private fun acceptLoop(ss: ServerSocket) {

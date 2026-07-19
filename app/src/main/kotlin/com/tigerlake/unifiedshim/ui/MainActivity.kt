@@ -6,7 +6,6 @@ import android.content.pm.PackageManager
 import android.os.Bundle
 import android.os.Process
 import android.text.InputType
-import android.text.method.DigitsKeyListener
 import android.view.View
 import android.widget.Button
 import android.widget.EditText
@@ -20,6 +19,7 @@ import androidx.core.view.updatePadding
 import com.tigerlake.unifiedshim.common.Config
 import com.tigerlake.unifiedshim.distributor.DistributorService
 import com.tigerlake.unifiedshim.distributor.EndpointStore
+import com.tigerlake.unifiedshim.owner.NudgeListener
 import com.tigerlake.unifiedshim.owner.OwnerBridge
 import com.tigerlake.unifiedshim.owner.OwnerListenerService
 import com.tigerlake.unifiedshim.owner.OwnerStore
@@ -77,6 +77,19 @@ class MainActivity : Activity() {
         refresh()
     }
 
+    override fun onStart() {
+        super.onStart()
+        // While the owner screen is open, host the nudge listener so a distributor's
+        // announce lands with no FGS. applicationContext so the server never references
+        // the activity; the "activity" holder is released in onStop.
+        if (RoleDetector.detect(this) == Role.OWNER) NudgeListener.acquire(applicationContext, "activity")
+    }
+
+    override fun onStop() {
+        super.onStop()
+        NudgeListener.release("activity")
+    }
+
     override fun onResume() {
         super.onResume()
         // Opening the owner app is the manual provisioning trigger.
@@ -92,24 +105,18 @@ class MainActivity : Activity() {
 
         when (role) {
             Role.PRIVATE -> {
+                // Port assignment is fully automatic (see status: "Bridge port … (auto)").
                 controls.addView(button("Start distributor service") {
                     DistributorService.ensureStarted(this); refresh()
                 })
-                controls.addView(portEditor(role))
-                val cfg = Config(this)
-                controls.addView(TextView(this).apply { text = "\nOwner port (0 = manual provisioning):" })
-                controls.addView(
-                    singlePortField(cfg.ownerNudgePort.toString(), "Apply owner port") { applyOwnerNudgePort(it) }
-                )
             }
             Role.OWNER -> {
                 controls.addView(button("Sync now (provision pending accounts)") { syncOwner() })
-                controls.addView(portEditor(role))
                 val cfg = Config(this)
                 controls.addView(button("Auto-provision listener: ${if (cfg.ownerListenerEnabled) "ON" else "OFF"}") {
                     toggleOwnerListener()
                 })
-                controls.addView(TextView(this).apply { text = "Auto-provision listener port:" })
+                controls.addView(TextView(this).apply { text = "Listener port (must differ from distributor ports):" })
                 controls.addView(
                     singlePortField(cfg.ownerListenerPort.toString(), "Apply listener port") { applyOwnerListenerPort(it) }
                 )
@@ -139,62 +146,7 @@ class MainActivity : Activity() {
         }
     }
 
-    /**
-     * PRIVATE: single bind port + Apply. OWNER: comma-separated list of the
-     * distributor ports to reach + Apply. Two distributor profiles share the
-     * loopback netns, so each must bind a distinct port and the owner lists both.
-     */
-    private fun portEditor(role: Role): LinearLayout {
-        val cfg = Config(this)
-        val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        val edit = EditText(this).apply {
-            // TYPE_CLASS_NUMBER rejects the comma the owner's list needs, so the
-            // owner side uses a digits-plus-comma key listener instead.
-            if (role == Role.PRIVATE) inputType = InputType.TYPE_CLASS_NUMBER
-            else keyListener = DigitsKeyListener.getInstance("0123456789,")
-            setSingleLine()
-            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
-            setText(
-                if (role == Role.PRIVATE) cfg.bridgePort.toString()
-                else cfg.ownerBridgePorts.joinToString(",")
-            )
-        }
-        val apply = button(if (role == Role.PRIVATE) "Apply port" else "Apply ports") {
-            if (role == Role.PRIVATE) applyPrivatePort(cfg, edit.text.toString())
-            else applyOwnerPorts(cfg, edit.text.toString())
-        }
-        row.addView(edit)
-        row.addView(apply)
-        return row
-    }
-
-    private fun applyPrivatePort(cfg: Config, raw: String) {
-        val port = raw.trim().toIntOrNull()
-        if (port == null || port !in Config.PORT_RANGE) {
-            toast("Port must be ${Config.PORT_RANGE.first}..${Config.PORT_RANGE.last}")
-            return
-        }
-        val changed = port != cfg.bridgePort
-        cfg.bridgePort = port
-        if (changed && DistributorService.running) DistributorService.restart(this)
-        toast("Bridge port set to $port")
-        refresh()
-    }
-
-    private fun applyOwnerPorts(cfg: Config, raw: String) {
-        val ports = raw.split(',').map { it.trim() }.filter { it.isNotEmpty() }.map { it.toIntOrNull() }
-        if (ports.isEmpty() || ports.any { it == null || it !in Config.PORT_RANGE }) {
-            toast("Ports must be a comma list in ${Config.PORT_RANGE.first}..${Config.PORT_RANGE.last}")
-            return
-        }
-        cfg.ownerBridgePorts = ports.filterNotNull()
-        toast("Owner ports set to ${cfg.ownerBridgePorts.joinToString(",")}")
-        refresh()
-    }
-
-    /** A single numeric port field + Apply, for the auto-provision ports (owner
-     *  listener port; distributor's owner-nudge port). Plain TYPE_CLASS_NUMBER — no
-     *  comma list, unlike the owner's distributor-ports editor. */
+    /** A single numeric port field + Apply, for the owner's listener port. */
     private fun singlePortField(initial: String, applyLabel: String, onApply: (String) -> Unit): LinearLayout {
         val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
         val edit = EditText(this).apply {
@@ -226,21 +178,9 @@ class MainActivity : Activity() {
         }
         val changed = port != cfg.ownerListenerPort
         cfg.ownerListenerPort = port
-        if (changed && cfg.ownerListenerEnabled && OwnerListenerService.running) OwnerListenerService.restart(this)
+        // Rebind if the listener is currently up under either holder (FGS/activity).
+        if (changed) NudgeListener.restart(applicationContext)
         toast("Listener port set to $port")
-        refresh()
-    }
-
-    /** Distributor-side owner-nudge port. 0 is a valid input meaning disabled. */
-    private fun applyOwnerNudgePort(raw: String) {
-        val cfg = Config(this)
-        val port = raw.trim().toIntOrNull()
-        if (port == null || (port != 0 && port !in Config.PORT_RANGE)) {
-            toast("Port must be 0 (manual) or ${Config.PORT_RANGE.first}..${Config.PORT_RANGE.last}")
-            return
-        }
-        cfg.ownerNudgePort = port
-        toast(if (port == 0) "Owner port cleared (manual provisioning)" else "Owner port set to $port")
         refresh()
     }
 
@@ -258,10 +198,8 @@ class MainActivity : Activity() {
         when (role) {
             Role.PRIVATE -> {
                 val cfg = Config(this@MainActivity)
-                appendLine("Bridge listener: 127.0.0.1:${cfg.bridgePort}")
+                appendLine("Bridge port: ${cfg.bridgePort} (auto)")
                 appendLine("Service running: ${DistributorService.running}")
-                val np = cfg.ownerNudgePort
-                appendLine("Owner nudge port: ${if (np in Config.PORT_RANGE) np.toString() else "manual (disabled)"}")
                 val store = EndpointStore.get(this@MainActivity)
                 appendLine("Registrations (${store.all().size}):")
                 store.all().forEach { r ->
@@ -274,7 +212,7 @@ class MainActivity : Activity() {
             }
             Role.OWNER -> {
                 val cfg = Config(this@MainActivity)
-                appendLine("Distributor ports: ${cfg.ownerBridgePorts.joinToString(",")}")
+                appendLine("Distributor ports (auto): ${cfg.ownerBridgePorts.joinToString(",")}")
                 appendLine(
                     if (cfg.ownerListenerEnabled)
                         "Auto-provision listener: ON 127.0.0.1:${cfg.ownerListenerPort} (running=${OwnerListenerService.running})"
