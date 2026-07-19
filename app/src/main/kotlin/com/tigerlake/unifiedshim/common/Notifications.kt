@@ -13,6 +13,10 @@ object Notifications {
     const val CHANNEL_ID = "unifiedshim_fgs"
     const val NOTIF_ID = 1
 
+    /** Distinct id for the optional owner-side auto-provision listener FGS, so it
+     *  doesn't collide with the distributor FGS notification if both ever coexist. */
+    const val NOTIF_ID_OWNER = 2
+
     fun ensureChannel(context: Context) {
         val nm = context.getSystemService(NotificationManager::class.java)
         if (nm.getNotificationChannel(CHANNEL_ID) == null) {

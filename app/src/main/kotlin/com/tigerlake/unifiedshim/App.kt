@@ -7,6 +7,7 @@ import com.tigerlake.unifiedshim.common.Notifications
 import com.tigerlake.unifiedshim.distributor.DistributorService
 import com.tigerlake.unifiedshim.distributor.LinkActivity
 import com.tigerlake.unifiedshim.distributor.RegisterReceiver
+import com.tigerlake.unifiedshim.owner.OwnerListenerService
 import com.tigerlake.unifiedshim.owner.OwnerPushReceiver
 import com.tigerlake.unifiedshim.role.Role
 import com.tigerlake.unifiedshim.role.RoleDetector
@@ -24,6 +25,10 @@ class App : Application() {
         setComponentEnabled(LinkActivity::class.java, !owner)
         setComponentEnabled(DistributorService::class.java, !owner)
         setComponentEnabled(OwnerPushReceiver::class.java, owner)
+        // Optional owner-side auto-provision listener: owner-role only (it's gated
+        // further by ownerListenerEnabled at start time; disabling here just keeps
+        // the wrong-profile stack un-triggerable, like OwnerPushReceiver).
+        setComponentEnabled(OwnerListenerService::class.java, owner)
     }
 
     private fun setComponentEnabled(cls: Class<*>, enabled: Boolean) {

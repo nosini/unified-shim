@@ -21,6 +21,7 @@ import com.tigerlake.unifiedshim.common.Config
 import com.tigerlake.unifiedshim.distributor.DistributorService
 import com.tigerlake.unifiedshim.distributor.EndpointStore
 import com.tigerlake.unifiedshim.owner.OwnerBridge
+import com.tigerlake.unifiedshim.owner.OwnerListenerService
 import com.tigerlake.unifiedshim.owner.OwnerStore
 import com.tigerlake.unifiedshim.role.Role
 import com.tigerlake.unifiedshim.role.RoleDetector
@@ -95,10 +96,23 @@ class MainActivity : Activity() {
                     DistributorService.ensureStarted(this); refresh()
                 })
                 controls.addView(portEditor(role))
+                val cfg = Config(this)
+                controls.addView(TextView(this).apply { text = "\nOwner port (0 = manual provisioning):" })
+                controls.addView(
+                    singlePortField(cfg.ownerNudgePort.toString(), "Apply owner port") { applyOwnerNudgePort(it) }
+                )
             }
             Role.OWNER -> {
                 controls.addView(button("Sync now (provision pending accounts)") { syncOwner() })
                 controls.addView(portEditor(role))
+                val cfg = Config(this)
+                controls.addView(button("Auto-provision listener: ${if (cfg.ownerListenerEnabled) "ON" else "OFF"}") {
+                    toggleOwnerListener()
+                })
+                controls.addView(TextView(this).apply { text = "Auto-provision listener port:" })
+                controls.addView(
+                    singlePortField(cfg.ownerListenerPort.toString(), "Apply listener port") { applyOwnerListenerPort(it) }
+                )
                 controls.addView(TextView(this).apply { text = "\nSelect ntfy app as distributor:" })
                 val self = packageName
                 UnifiedPush.getDistributors(this).filter { it != self }.forEach { dist ->
@@ -178,6 +192,58 @@ class MainActivity : Activity() {
         refresh()
     }
 
+    /** A single numeric port field + Apply, for the auto-provision ports (owner
+     *  listener port; distributor's owner-nudge port). Plain TYPE_CLASS_NUMBER — no
+     *  comma list, unlike the owner's distributor-ports editor. */
+    private fun singlePortField(initial: String, applyLabel: String, onApply: (String) -> Unit): LinearLayout {
+        val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        val edit = EditText(this).apply {
+            inputType = InputType.TYPE_CLASS_NUMBER
+            setSingleLine()
+            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
+            setText(initial)
+        }
+        row.addView(edit)
+        row.addView(button(applyLabel) { onApply(edit.text.toString()) })
+        return row
+    }
+
+    private fun toggleOwnerListener() {
+        val cfg = Config(this)
+        val enable = !cfg.ownerListenerEnabled
+        cfg.ownerListenerEnabled = enable
+        if (enable) OwnerListenerService.ensureStarted(this) else OwnerListenerService.stop(this)
+        toast(if (enable) "Auto-provision listener enabled" else "Auto-provision listener disabled")
+        refresh()
+    }
+
+    private fun applyOwnerListenerPort(raw: String) {
+        val cfg = Config(this)
+        val port = raw.trim().toIntOrNull()
+        if (port == null || port !in Config.PORT_RANGE) {
+            toast("Port must be ${Config.PORT_RANGE.first}..${Config.PORT_RANGE.last}")
+            return
+        }
+        val changed = port != cfg.ownerListenerPort
+        cfg.ownerListenerPort = port
+        if (changed && cfg.ownerListenerEnabled && OwnerListenerService.running) OwnerListenerService.restart(this)
+        toast("Listener port set to $port")
+        refresh()
+    }
+
+    /** Distributor-side owner-nudge port. 0 is a valid input meaning disabled. */
+    private fun applyOwnerNudgePort(raw: String) {
+        val cfg = Config(this)
+        val port = raw.trim().toIntOrNull()
+        if (port == null || (port != 0 && port !in Config.PORT_RANGE)) {
+            toast("Port must be 0 (manual) or ${Config.PORT_RANGE.first}..${Config.PORT_RANGE.last}")
+            return
+        }
+        cfg.ownerNudgePort = port
+        toast(if (port == 0) "Owner port cleared (manual provisioning)" else "Owner port set to $port")
+        refresh()
+    }
+
     private fun buildStatus(role: Role): String = buildString {
         appendLine("Role: $role")
         appendLine("UID: ${Process.myUid()} (appId=${Process.myUid() % 100_000}, user=${Process.myUid() / 100_000})")
@@ -194,6 +260,8 @@ class MainActivity : Activity() {
                 val cfg = Config(this@MainActivity)
                 appendLine("Bridge listener: 127.0.0.1:${cfg.bridgePort}")
                 appendLine("Service running: ${DistributorService.running}")
+                val np = cfg.ownerNudgePort
+                appendLine("Owner nudge port: ${if (np in Config.PORT_RANGE) np.toString() else "manual (disabled)"}")
                 val store = EndpointStore.get(this@MainActivity)
                 appendLine("Registrations (${store.all().size}):")
                 store.all().forEach { r ->
@@ -207,6 +275,11 @@ class MainActivity : Activity() {
             Role.OWNER -> {
                 val cfg = Config(this@MainActivity)
                 appendLine("Distributor ports: ${cfg.ownerBridgePorts.joinToString(",")}")
+                appendLine(
+                    if (cfg.ownerListenerEnabled)
+                        "Auto-provision listener: ON 127.0.0.1:${cfg.ownerListenerPort} (running=${OwnerListenerService.running})"
+                    else "Auto-provision listener: OFF (manual provisioning)"
+                )
                 appendLine("ntfy distributor: ${UnifiedPush.getSavedDistributor(this@MainActivity) ?: "(none selected)"}")
                 val store = OwnerStore.get(this@MainActivity)
                 val eps = store.knownEndpoints()

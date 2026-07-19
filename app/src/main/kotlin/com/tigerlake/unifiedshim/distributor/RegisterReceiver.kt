@@ -47,6 +47,14 @@ class RegisterReceiver : BroadcastReceiver() {
             context.startForegroundService(forward)
         } catch (e: Exception) {
             Logx.w("recv", "could not start distributor service: ${e.message}")
+            // FGS couldn't start (background restriction), but the state is already
+            // persisted above. Best-effort nudge the optional owner listener so it
+            // reconciles now instead of waiting for a manual owner-app open. goAsync
+            // keeps the process alive across the blocking loopback round-trip.
+            val pending = goAsync()
+            Thread {
+                try { OwnerNudger.nudge(context) } finally { pending.finish() }
+            }.apply { isDaemon = true }.start()
         }
     }
 }

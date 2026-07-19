@@ -35,6 +35,12 @@ object Protocol {
     const val PUSH: Byte = 0x20
     const val PUSH_ACK: Byte = 0x21
 
+    /** Optional auto-provision: distributor→owner, on the owner's listener (not the
+     *  distributor listener). Nudges the event-driven owner to reconcile a single
+     *  distributor port the moment a registration changes. Body carries the
+     *  sender's own bridge port. */
+    const val NUDGE: Byte = 0x30
+
     private fun json(type: Byte, obj: JSONObject) =
         Frame(type, obj.toString().toByteArray(StandardCharsets.UTF_8))
 
@@ -100,6 +106,11 @@ object Protocol {
     }
 
     fun pushAck(msgId: Long) = json(PUSH_ACK, JSONObject().put("msgId", msgId))
+
+    // ---- auto-provision nudge ----
+
+    /** [port] is the sender distributor's own bridge port. */
+    fun nudge(port: Int) = json(NUDGE, JSONObject().put("port", port))
 
     private fun JSONArray.toStringList(): List<String> =
         (0 until length()).map { getString(it) }

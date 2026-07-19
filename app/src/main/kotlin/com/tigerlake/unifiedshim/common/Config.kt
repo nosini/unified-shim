@@ -44,10 +44,37 @@ class Config(context: Context) {
             prefs.edit().putString(KEY_OWNER_PORTS, clean.joinToString(",")).apply()
         }
 
+    /**
+     * Optional owner-side auto-provision listener. Off by default: enabling it adds
+     * an always-on FGS in the owner profile (relaxing the "nothing persistent in the
+     * owner profile" property), letting a distributor nudge the owner the instant a
+     * registration changes instead of waiting for the user to open the owner app.
+     */
+    var ownerListenerEnabled: Boolean
+        get() = prefs.getBoolean(KEY_OWNER_LISTENER_ENABLED, false)
+        set(v) = prefs.edit().putBoolean(KEY_OWNER_LISTENER_ENABLED, v).apply()
+
+    /** Loopback port the owner's auto-provision listener binds. */
+    var ownerListenerPort: Int
+        get() = prefs.getInt(KEY_OWNER_LISTENER_PORT, OWNER_LISTENER_PORT).takeIf { it in PORT_RANGE } ?: OWNER_LISTENER_PORT
+        set(v) = prefs.edit().putInt(KEY_OWNER_LISTENER_PORT, v.coerceIn(PORT_RANGE)).apply()
+
+    /**
+     * Distributor-side: the owner's listener port to nudge on a registration change.
+     * 0 (or any value outside [PORT_RANGE]) means nudging is disabled — manual
+     * provisioning, the default status quo.
+     */
+    var ownerNudgePort: Int
+        get() = prefs.getInt(KEY_OWNER_NUDGE_PORT, OWNER_LISTENER_PORT)
+        set(v) = prefs.edit().putInt(KEY_OWNER_NUDGE_PORT, v).apply()
+
     companion object {
         private const val KEY_FORCED_ROLE = "forced_role"
         private const val KEY_BRIDGE_PORT = "bridge_port"
         private const val KEY_OWNER_PORTS = "owner_bridge_ports"
+        private const val KEY_OWNER_LISTENER_ENABLED = "owner_listener_enabled"
+        private const val KEY_OWNER_LISTENER_PORT = "owner_listener_port"
+        private const val KEY_OWNER_NUDGE_PORT = "owner_nudge_port"
 
         /** Valid TCP port range for a user-configured bridge port. */
         val PORT_RANGE = 1024..65535
@@ -60,5 +87,10 @@ class Config(context: Context) {
          * can coexist.
          */
         const val BRIDGE_PORT = 28472
+
+        /** Default port for the optional owner auto-provision listener (and thus the
+         *  default distributor nudge target). Distinct from [BRIDGE_PORT] so the owner
+         *  listener and a same-profile distributor listener never contend. */
+        const val OWNER_LISTENER_PORT = 28471
     }
 }

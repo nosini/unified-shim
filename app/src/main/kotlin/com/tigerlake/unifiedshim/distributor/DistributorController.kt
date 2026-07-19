@@ -17,6 +17,11 @@ import com.tigerlake.unifiedshim.transport.protocol.Protocol
 class DistributorController(
     private val store: EndpointStore,
     private val messenger: AppMessenger,
+    // Best-effort nudge to the optional owner auto-provision listener. Injected so
+    // the controller stays pure and the (blocking) round-trip runs off-thread in
+    // the caller. Invoked only on registration-state changes — never in response to
+    // owner-initiated frames — to avoid a nudge→reconcile→connect feedback loop.
+    private val nudgeOwner: () -> Unit = {},
 ) {
     @Volatile private var link: BridgeLink? = null
 
@@ -67,15 +72,18 @@ class DistributorController(
             return
         }
         store.putPending(token, app)
-        // If the owner happens to be connected, nudge it; otherwise this is picked
-        // up the next time the owner runs and reconciles.
-        link?.let { sendSnapshot(it) }
+        // If the owner is already connected, its live snapshot reaches this reg — no
+        // nudge needed. Otherwise nudge the optional owner listener so it reconciles
+        // now; if that's disabled/unreachable it falls back to the next owner run.
+        val l = link
+        if (l != null) sendSnapshot(l) else nudgeOwner()
     }
 
     fun onUnregister(token: String) {
         val reg = store.markDeprovision(token) ?: return
         messenger.unregistered(reg.app, token)
-        link?.let { sendSnapshot(it) }
+        val l = link
+        if (l != null) sendSnapshot(l) else nudgeOwner()
     }
 
     // ---- frames from the owner link ----

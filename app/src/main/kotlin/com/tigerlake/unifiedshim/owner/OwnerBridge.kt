@@ -71,6 +71,12 @@ object OwnerBridge {
         synchronized(lock) { reconcileAllPorts(context) }
     }
 
+    /** Reconcile a single distributor port. Used by the optional auto-provision
+     *  listener when a distributor nudges us, so we don't sweep every port. */
+    fun reconcilePort(context: Context, port: Int) {
+        synchronized(lock) { runSession(context, port) }
+    }
+
     // ---- routing ----
 
     /** Route a token-directed op: session to its owning port if known, else a full

@@ -33,7 +33,8 @@ class DistributorService : Service() {
         )
 
         running = true
-        controller = DistributorController(EndpointStore.get(this), AppMessenger(this))
+        val store = EndpointStore.get(this)
+        controller = DistributorController(store, AppMessenger(this), nudgeOwner = ::nudgeOwnerAsync)
         val port = Config(this).bridgePort
         Logx.i("dist", "binding loopback listener on :$port")
         server = LoopbackServer(
@@ -46,6 +47,16 @@ class DistributorService : Service() {
             onLinkClosed = { link -> controller.onOwnerLinkClosed(link) },
         )
         server.start()
+
+        // Registrations may have arrived (or been dropped) while this service was
+        // down — the owner can't be woken cross-profile, so nudge the optional owner
+        // listener once at startup to reconcile anything still pending.
+        if (store.all().any { it.pending } || store.deprovisionTokens().isNotEmpty()) nudgeOwnerAsync()
+    }
+
+    /** Fire OwnerNudger off the main thread — it does a blocking loopback round-trip. */
+    private fun nudgeOwnerAsync() {
+        Thread({ OwnerNudger.nudge(this) }, "owner-nudge").apply { isDaemon = true }.start()
     }
 
     /**

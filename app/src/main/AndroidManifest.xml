@@ -88,6 +88,19 @@
                 android:value="Cross-profile UnifiedPush distributor: keeps the local push listener bound." />
         </service>
 
+        <!-- Optional owner-side auto-provision listener (OFF by default). When
+             enabled it is the only persistent component in the owner profile; it
+             lets a distributor nudge the owner to reconcile the instant a
+             registration changes, removing the manual "open the owner app" step. -->
+        <service
+            android:name=".owner.OwnerListenerService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Optional cross-profile UnifiedPush auto-provision: owner listens for a distributor nudge to reconcile registrations immediately." />
+        </service>
+
         <!-- ============ ntfy connector surface (owner side) ============ -->
 
         <!-- Owner-side UnifiedPush *connector*. The ntfy app delivers here and

@@ -48,9 +48,10 @@ OwnerPushReceiver (our connector, woken on demand)    DistributorController
 
 - **The distributor listens and stays foregrounded** — it can't be woken
   cross-profile, so its FGS keeps the listener bound.
-- **Owner is event-driven** — no foreground service, no websocket. It is woken by
-  the ntfy app's UnifiedPush broadcasts (and by the user opening the app), opens a
-  short-lived socket connection, does its business, and closes. With more than one
+- **Owner is event-driven** — no foreground service, no websocket (unless the
+  optional [auto-provision](#auto-provision-optional) listener is enabled). It is
+  woken by the ntfy app's UnifiedPush broadcasts (and by the user opening the app),
+  opens a short-lived socket connection, does its business, and closes. With more than one
   distributor profile it opens one session per configured port, sequentially under
   a single lock, and routes every token to the port whose snapshot it appeared in.
 - **Role detection** (`role/RoleDetector.kt`): owner/system user has profile
@@ -73,8 +74,11 @@ OwnerPushReceiver (our connector, woken on demand)    DistributorController
 1. `RegisterReceiver` (REGISTER, advertises us as a distributor) → `DistributorService`.
 2. `DistributorController` stores a *pending* registration keyed by the connector
    `token`. It can't reach a sleeping owner, so the endpoint is provisioned the
-   next time the owner runs.
-3. When the owner runs (you open the owner app — the manual sync trigger), it
+   next time the owner runs — **or, with [auto-provision](#auto-provision-optional)
+   enabled, the distributor nudges the owner immediately** and provisioning is
+   automatic end to end.
+3. When the owner runs (you open the owner app — the manual sync trigger, or it is
+   nudged by a distributor), it
    connects to the private listener. The private side pushes its full
    `REGISTRATIONS` snapshot.
 4. For each token without an endpoint, the owner calls `UnifiedPush.registerApp`
@@ -121,6 +125,7 @@ Frame: `[int32 length][byte type][body]`. Control/handshake bodies are UTF-8 JSO
 | `DEPROVISIONED` 0x12 | owner→priv | JSON `{token}` |
 | `PUSH` 0x20 | owner→priv | `[int64 msgId][int16 tokenLen][token][payload]` |
 | `PUSH_ACK` 0x21 | priv→owner | JSON `{msgId}` |
+| `NUDGE` 0x30 | priv→owner | JSON `{port}` — flows on the **owner's** [auto-provision](#auto-provision-optional) listener (not the distributor listener); the sender's own bridge port |
 
 The owner is the client and connects per wakeup; the private side is the server
 and pushes `REGISTRATIONS` immediately after the handshake so the exchange is
@@ -156,6 +161,52 @@ Persisted in `Config` (`bridgePort`, `ownerBridgePorts`) and, on the owner, the
 
 ---
 
+## Auto-provision (optional)
+
+By default the owner profile runs **nothing persistent** and a brand-new
+registration waits until you open the owner app once (the manual sync). That
+manual step is the price of the "no persistent owner component" property.
+
+**Auto-provision** trades that property for full automation: registrations
+provision **start to finish with no manual sync anywhere**. It is **off by
+default** — turning it on adds an always-on foreground service in the *owner*
+profile (`OwnerListenerService`, a `specialUse` FGS like the distributor's),
+relaxing the "nothing persistent in the owner profile" constraint. That's the
+whole trade-off; the manual-open flow still works and remains the default.
+
+How it works: the owner listener binds its own loopback port. When a registration
+changes (or the distributor service restarts with pending work), the distributor
+opens a one-shot authenticated connection to that port and sends a `NUDGE` frame
+carrying its own bridge port. The owner reconciles that single port immediately —
+exactly the work `Sync now` would do. The nudge fires **only** on registration
+state changes and distributor startup, never in response to owner-initiated
+traffic, so there's no feedback loop. A dead or disabled owner listener is
+indistinguishable from manual mode (every nudge is best-effort and swallowed).
+
+The owner **auto-learns distributor ports from nudges**: the auth handshake already
+proves the peer is our own signed APK in another profile, so a nudged port that
+isn't in *Distributor ports* yet is added automatically — no owner-side port config
+needed for a nudging distributor.
+
+Setup:
+- **Owner** (OWNER screen): tap **Auto-provision listener: OFF** to turn it **ON**.
+  Note the listener port (default `28471`); change it with **Apply listener port**
+  if needed.
+- **Each distributor** (PRIVATE screen): set **Owner port** to the owner's listener
+  port (default `28471`). `0` disables nudging for that profile (manual
+  provisioning).
+
+The owner listener shares the device's single loopback netns with every
+distributor listener, so its port must be **distinct from every bridge port**
+(the defaults `28471` vs `28472` already are) — a collision leaves whichever
+side binds second stuck retrying.
+
+Persisted in `Config` (`ownerListenerEnabled`, `ownerListenerPort`,
+`ownerNudgePort`). Started from the owner toggle and, on boot, by `BootReceiver`
+when `ownerListenerEnabled`.
+
+---
+
 ## Module / package layout
 
 Single `:app` module; the **`transport/` package is the isolation seam** — both
@@ -172,9 +223,10 @@ com.tigerlake.unifiedshim
 │   ├── BridgeLink (stream-based, transport-agnostic)
 │   └── loopback/  LoopbackServer (private), LoopbackClient (owner one-shot)
 ├── distributor/   (distributor role) RegisterReceiver, LinkActivity, DistributorService,
-│                   DistributorController, EndpointStore, AppMessenger, UnifiedPush
-├── owner/         (owner role) OwnerPushReceiver (UP connector), OwnerBridge, OwnerStore
-├── boot/          BootReceiver (starts the distributor FGS; owner needs nothing)
+│                   DistributorController, EndpointStore, AppMessenger, UnifiedPush, OwnerNudger
+├── owner/         (owner role) OwnerPushReceiver (UP connector), OwnerBridge, OwnerStore,
+│                   OwnerListenerService (optional auto-provision FGS)
+├── boot/          BootReceiver (starts the distributor FGS; owner FGS only if auto-provision on)
 └── ui/            MainActivity (status + role/port config + distributor picker + manual sync)
 ```
 
@@ -239,8 +291,9 @@ Logs: `adb logcat -s ushim`.
 
 - **The owner shim never connects to ntfy.sh.** It is a UnifiedPush connector to
   the ntfy app; the ntfy app owns the single radio + FGS in the owner profile.
-- **No persistent component in the owner profile beyond the ntfy app.** Our owner
-  shim is woken on demand by UnifiedPush broadcasts.
+- **No persistent component in the owner profile beyond the ntfy app** — unless the
+  optional [auto-provision](#auto-provision-optional) listener is enabled. Our owner
+  shim is otherwise woken on demand by UnifiedPush broadcasts.
 - **TCP loopback, not unix sockets.** Filesystem-path sockets fail under
   per-profile storage isolation, and abstract-namespace sockets are SELinux-blocked
   cross-profile (MLS `connectto` denial). Loopback TCP crosses the shared netns;
@@ -252,6 +305,8 @@ Logs: `adb logcat -s ushim`.
   reads them via `getByteArrayExtra`. The receiving app decrypts with its own key.
 - **First provisioning of a new registration needs the owner app opened once** — the
   private side can't wake a sleeping owner. Subsequent pushes flow automatically.
+  The optional [auto-provision](#auto-provision-optional) listener removes even this
+  one manual step, at the cost of a persistent owner-profile FGS.
 - **Delivery is at-least-once with de-dupe.** Every push is written to the owner's
   durable outbox (`OwnerStore`) *before* any send and removed only on its
   `PUSH_ACK`, so an unreachable private side (locked / rebooting / Android-17 grant
