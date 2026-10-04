@@ -7,8 +7,11 @@
 .idea/
 .claude/
 
-# Signing key — never commit. Build references it via app/build.gradle.kts;
-# keep it backed up out-of-band (losing it means future updates can't install
-# over an existing install without uninstalling first).
+# Signing key and its password — never commit. Local builds read them through
+# keystore.properties (see app/build.gradle.kts), CI through repository secrets.
+# Keep the key backed up out-of-band (losing it means future updates can't
+# install over an existing install without uninstalling first).
 *.jks
 *.keystore
+*.base64
+/keystore.properties

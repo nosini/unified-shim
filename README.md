@@ -260,12 +260,29 @@ eu.nosini.unifiedshim
 
 ## Build & install
 
-Built with the Android SDK at `/opt/android-sdk` (Gradle 8.14.2 / AGP 8.7.3 /
-Kotlin 2.1.0):
+GitHub Actions builds a signed release APK on every push to `main` (download it
+from the run's artifacts) and publishes it as a GitHub release for `v*` tags. The
+tag must match `versionName`. The workflow needs two repository secrets:
+
+- `SIGNING_KEYSTORE_BASE64` — the keystore, base64-encoded (`base64 -w0 release.jks`)
+- `SIGNING_STORE_PASSWORD` — its password (PKCS12, so it's also the key password)
+
+The key alias is `unifiedshim`.
+
+To build locally (Gradle 8.14.2 / AGP 8.7.3 / Kotlin 2.1.0), point `sdk.dir` in
+`local.properties` or `ANDROID_HOME` at an Android SDK and put the signing details
+in a gitignored `keystore.properties` next to `settings.gradle.kts`:
+
+```properties
+storeFile=release.jks
+storePassword=...
+keyAlias=unifiedshim
+```
+
+Without it, `assembleRelease` produces an unsigned APK.
 
 ```bash
 ./gradlew :app:assembleRelease
-# release is signed with unified-shim-release.jks (see app/build.gradle.kts)
 adb install -r app/build/outputs/apk/release/app-release.apk                 # owner profile
 adb install -r --user <PRIVATE_USER_ID> app/build/.../app-release.apk        # private space
 ```
@@ -283,7 +300,8 @@ since Android won't update across different signers.
 0.5.0 changed the application ID to `eu.nosini.unifiedshim`. Android treats it as
 a different app, so it installs next to the old one rather than replacing it, and
 nothing carries over: settings, registrations and the `INTERACT_ACROSS_USERS`
-grant all start fresh. In every profile, uninstall the old ID
+grant all start fresh. It is also signed with a new key, so it won't pair with a
+0.4.x install in another profile. In every profile, uninstall the old ID
 (`adb uninstall --user N com.tigerlake.unifiedshim`), install the new APK, redo the
 grant below, then pick the shim as distributor again in each UnifiedPush app so it
 re-registers and gets a new endpoint.
