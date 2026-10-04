@@ -239,7 +239,7 @@ controllers only touch a (stream-based) `BridgeLink`. If the loopback approach i
 ever blocked too, swap `loopback/` and nothing else changes.
 
 ```
-com.tigerlake.unifiedshim
+eu.nosini.unifiedshim
 ├── role/          RoleDetector, Role, ServiceLauncher
 ├── common/        Config, Logx, Notifications
 ├── transport/     ← rip-out seam (cross-profile loopback)
@@ -275,8 +275,18 @@ Find the private space user id with `adb shell pm list users`.
 Both profiles must run the **same** signed APK: the cross-profile auth handshake
 is keyed by the signing certificate, so a debug-signed and a release-signed copy
 won't pair. Switching signing (e.g. from an earlier debug install) requires an
-**uninstall first** in each profile (`adb uninstall [--user N] com.tigerlake.unifiedshim`),
+**uninstall first** in each profile (`adb uninstall [--user N] eu.nosini.unifiedshim`),
 since Android won't update across different signers.
+
+### Upgrading from 0.4.x (`com.tigerlake.unifiedshim`)
+
+0.5.0 changed the application ID to `eu.nosini.unifiedshim`. Android treats it as
+a different app, so it installs next to the old one rather than replacing it, and
+nothing carries over: settings, registrations and the `INTERACT_ACROSS_USERS`
+grant all start fresh. In every profile, uninstall the old ID
+(`adb uninstall --user N com.tigerlake.unifiedshim`), install the new APK, redo the
+grant below, then pick the shim as distributor again in each UnifiedPush app so it
+re-registers and gets a new endpoint.
 
 ### Android 17+ (cross-profile loopback permission)
 
@@ -286,9 +296,9 @@ Android 17 (June 2026) gates cross-profile loopback behind
 app runs in, then restart:
 
 ```bash
-adb shell pm grant --user 0  com.tigerlake.unifiedshim android.permission.INTERACT_ACROSS_USERS
-adb shell pm grant --user 10 com.tigerlake.unifiedshim android.permission.INTERACT_ACROSS_USERS
-adb shell am force-stop --user 10 com.tigerlake.unifiedshim
+adb shell pm grant --user 0  eu.nosini.unifiedshim android.permission.INTERACT_ACROSS_USERS
+adb shell pm grant --user 10 eu.nosini.unifiedshim android.permission.INTERACT_ACROSS_USERS
+adb shell am force-stop --user 10 eu.nosini.unifiedshim
 ```
 
 (Use your profile user ids from `pm list users` in place of `10`.) On Android
@@ -312,7 +322,7 @@ it. Shelter's cross-profile toggles (intents/contacts/file shuttle) are unrelate
 and don't help. Ways out:
 
 - **Root** — a root shell bypasses the shell-user check:
-  `adb shell su -c 'pm grant --user N com.tigerlake.unifiedshim android.permission.INTERACT_ACROSS_USERS'`
+  `adb shell su -c 'pm grant --user N eu.nosini.unifiedshim android.permission.INTERACT_ACROSS_USERS'`
 - **Island** instead of Shelter — it permits debugging inside its profile, so the
   normal `pm grant --user N` works.
 - **A custom/forked profile owner** that calls

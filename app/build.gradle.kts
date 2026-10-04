@@ -4,17 +4,17 @@ plugins {
 }
 
 android {
-    namespace = "com.tigerlake.unifiedshim"
+    namespace = "eu.nosini.unifiedshim"
     compileSdk = 35
 
     defaultConfig {
-        applicationId = "com.tigerlake.unifiedshim"
+        applicationId = "eu.nosini.unifiedshim"
         // Private space is API 35; the owner side runs fine lower. 29 keeps the
         // owner side broadly compatible while abstract sockets + FGS are available.
         minSdk = 29
         targetSdk = 35
-        versionCode = 5
-        versionName = "0.4.1"
+        versionCode = 6
+        versionName = "0.5.0"
     }
 
     signingConfigs {
