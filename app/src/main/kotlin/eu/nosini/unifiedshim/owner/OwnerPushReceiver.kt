@@ -20,7 +20,20 @@ class OwnerPushReceiver : MessagingReceiver() {
         val pending = goAsync()
         Thread {
             try {
-                super.onReceive(context, intent)
+                val worker = Thread {
+                    try {
+                        super.onReceive(context, intent)
+                    } catch (e: Exception) {
+                        Logx.e("owner", "receiver error", e)
+                    }
+                }.apply { isDaemon = true }
+                worker.start()
+                // A slow sweep must not hold the broadcast token until the system
+                // kills us; the push itself is already durably enqueued by deliver().
+                worker.join(MAX_WORK_MS)
+                if (worker.isAlive) {
+                    Logx.w("owner", "connector work still running after ${MAX_WORK_MS}ms; finishing broadcast")
+                }
             } catch (e: Exception) {
                 Logx.e("owner", "receiver error", e)
             } finally {
@@ -45,5 +58,10 @@ class OwnerPushReceiver : MessagingReceiver() {
 
     override fun onRegistrationFailed(context: Context, instance: String) {
         Logx.w("owner", "ntfy registration failed for instance=$instance")
+        OwnerBridge.registrationFailed(context, token = instance, reason = "INTERNAL_ERROR")
+    }
+
+    private companion object {
+        const val MAX_WORK_MS = 8_000L
     }
 }

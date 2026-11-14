@@ -23,7 +23,12 @@ import org.json.JSONObject
  */
 class OwnerStore private constructor(context: Context) {
 
-    class PendingPush(val msgId: Long, val token: String, val payload: ByteArray)
+    class PendingPush(
+        val msgId: Long,
+        val token: String,
+        val payload: ByteArray,
+        val attempts: Int = 0,
+    )
 
     private val prefs = context.applicationContext
         .getSharedPreferences("unifiedshim_owner", Context.MODE_PRIVATE)
@@ -39,6 +44,9 @@ class OwnerStore private constructor(context: Context) {
     @Synchronized fun endpointFor(token: String): String? = endpoints[token]
     @Synchronized fun knownEndpoints(): Map<String, String> = HashMap(endpoints)
 
+    /** Every token we know about (provisioned or bound to a distributor). */
+    @Synchronized fun knownTokens(): Set<String> = endpoints.keys + ports.keys
+
     /** Which distributor port owns this token, if we've seen it in a snapshot. */
     @Synchronized fun portFor(token: String): Int? = ports[token]
 
@@ -51,29 +59,41 @@ class OwnerStore private constructor(context: Context) {
         if (existing == port) return
         if (existing != null) Logx.w("store", "token=$token remapped port $existing -> $port")
         ports[token] = port
-        persist()
+        persistPorts()
     }
 
     @Synchronized
     fun putEndpoint(token: String, endpoint: String) {
         if (endpoints[token] != endpoint) {
             endpoints[token] = endpoint
-            persist()
+            persistEndpoints()
+        }
+    }
+
+    /** Drop an endpoint learned from a distributor we are switching away from. */
+    @Synchronized
+    fun clearEndpoints() {
+        if (endpoints.isNotEmpty()) {
+            endpoints.clear()
+            persistEndpoints()
         }
     }
 
     @Synchronized
     fun forget(token: String) {
-        var changed = endpoints.remove(token) != null
-        if (ports.remove(token) != null) changed = true
-        if (changed) persist()
+        val endpointsChanged = endpoints.remove(token) != null
+        val portsChanged = ports.remove(token) != null
+        val pendingChanged = pending.removeAll { it.token == token }
+        if (endpointsChanged) persistEndpoints()
+        if (portsChanged) persistPorts()
+        if (pendingChanged) persistPending()
     }
 
     @Synchronized
     fun enqueue(push: PendingPush) {
         if (pending.size >= MAX_PENDING) pending.removeFirst()
         pending.addLast(push)
-        persist()
+        persistPending()
     }
 
     @Synchronized
@@ -81,23 +101,52 @@ class OwnerStore private constructor(context: Context) {
 
     @Synchronized
     fun removePending(msgId: Long) {
-        if (pending.removeAll { it.msgId == msgId }) persist()
+        if (pending.removeAll { it.msgId == msgId }) persistPending()
     }
 
-    private fun persist() {
+    /** Apply one flush's removals and attempt-counter updates with a single queue
+     *  write, instead of persisting once per push. */
+    @Synchronized
+    fun finishFlush(removed: Set<Long>, attempts: Map<Long, Int>) {
+        var changed = false
+        if (removed.isNotEmpty()) {
+            changed = pending.removeAll { it.msgId in removed } || changed
+        }
+        for (i in pending.indices) {
+            val p = pending[i]
+            val count = attempts[p.msgId] ?: continue
+            if (p.attempts != count) {
+                pending[i] = PendingPush(p.msgId, p.token, p.payload, count)
+                changed = true
+            }
+        }
+        if (changed) persistPending()
+    }
+
+    private fun persistEndpoints() {
         val eps = JSONObject()
         endpoints.forEach { (k, v) -> eps.put(k, v) }
+        prefs.edit().putString("endpoints", eps.toString()).apply()
+    }
+
+    private fun persistPorts() {
         val prt = JSONObject()
         ports.forEach { (k, v) -> prt.put(k, v) }
+        prefs.edit().putString("ports", prt.toString()).apply()
+    }
+
+    private fun persistPending() {
         val pp = JSONArray()
         pending.forEach {
-            pp.put(JSONObject().put("msgId", it.msgId).put("token", it.token).put("payload", Base64.encodeToString(it.payload, Base64.NO_WRAP)))
+            pp.put(
+                JSONObject()
+                    .put("msgId", it.msgId)
+                    .put("token", it.token)
+                    .put("payload", Base64.encodeToString(it.payload, Base64.NO_WRAP))
+                    .put("attempts", it.attempts),
+            )
         }
-        prefs.edit()
-            .putString("endpoints", eps.toString())
-            .putString("ports", prt.toString())
-            .putString("pending", pp.toString())
-            .apply()
+        prefs.edit().putString("pending", pp.toString()).apply()
     }
 
     private fun load() {
@@ -114,7 +163,14 @@ class OwnerStore private constructor(context: Context) {
                 val arr = JSONArray(raw)
                 for (i in 0 until arr.length()) {
                     val o = arr.getJSONObject(i)
-                    pending.addLast(PendingPush(o.getLong("msgId"), o.getString("token"), Base64.decode(o.getString("payload"), Base64.NO_WRAP)))
+                    pending.addLast(
+                        PendingPush(
+                            o.getLong("msgId"),
+                            o.getString("token"),
+                            Base64.decode(o.getString("payload"), Base64.NO_WRAP),
+                            o.optInt("attempts", 0),
+                        ),
+                    )
                 }
             }
         } catch (e: Exception) {

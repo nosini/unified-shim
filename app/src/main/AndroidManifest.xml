@@ -77,7 +77,7 @@
             </intent-filter>
         </receiver>
 
-        <!-- Private-space foreground service: hosts the abstract-socket listener
+        <!-- Private-space foreground service: hosts the loopback TCP listener
              and the distributor control/data logic. -->
         <service
             android:name=".distributor.DistributorService"

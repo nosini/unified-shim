@@ -44,9 +44,4 @@ object Notifications {
             .setContentIntent(tap)
             .build()
     }
-
-    fun update(context: Context, text: String) {
-        context.getSystemService(NotificationManager::class.java)
-            .notify(NOTIF_ID, build(context, text))
-    }
 }

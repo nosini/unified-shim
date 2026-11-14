@@ -61,16 +61,21 @@ jobs:
         run: |
           set -euo pipefail
           enabled=false
-          if [[ "$GITHUB_REF" == refs/heads/main || "$GITHUB_REF" == refs/tags/v* ]]; then
-            if [ -n "$KEYSTORE_BASE64" ]; then
-              enabled=true
-            elif [[ "$GITHUB_REF" == refs/tags/* ]]; then
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            if [ -z "$KEYSTORE_BASE64" ]; then
               echo "::error::SIGNING_KEYSTORE_BASE64 is required for tag builds"
               exit 1
             fi
-            if [[ "$GITHUB_REF" == refs/tags/* && -z "$STORE_PASSWORD" ]]; then
+            if [ -z "$STORE_PASSWORD" ]; then
               echo "::error::SIGNING_STORE_PASSWORD is required for tag builds"
               exit 1
+            fi
+            enabled=true
+          elif [[ "$GITHUB_REF" == refs/heads/main ]]; then
+            if [ -n "$KEYSTORE_BASE64" ] && [ -n "$STORE_PASSWORD" ]; then
+              enabled=true
+            else
+              echo "::warning::SIGNING_KEYSTORE_BASE64 and SIGNING_STORE_PASSWORD must both be set to sign main builds; building an unsigned APK"
             fi
           fi
           echo "enabled=$enabled" >> "$GITHUB_OUTPUT"

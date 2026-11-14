@@ -25,6 +25,10 @@ class DistributorController(
 ) {
     @Volatile private var link: BridgeLink? = null
 
+    /** A registration changed while an owner link was open. The owner only applies
+     *  the first snapshot of a session, so re-nudge once that link closes. */
+    @Volatile private var nudgeAfterLink = false
+
     /**
      * Bounded LRU of msgIds we have already dispatched to the app. The owner's
      * outbox is at-least-once, so the same msgId can arrive twice (e.g. an ack
@@ -47,6 +51,7 @@ class DistributorController(
     fun onOwnerLinkReady(l: BridgeLink) {
         link?.takeIf { it !== l }?.close()
         link = l
+        nudgeAfterLink = false
         Logx.i("dist", "owner link ready; sending registration snapshot")
         sendSnapshot(l)
     }
@@ -55,6 +60,10 @@ class DistributorController(
         if (link === l) {
             link = null
             Logx.w("dist", "owner link closed")
+            if (nudgeAfterLink) {
+                nudgeAfterLink = false
+                nudgeOwner()
+            }
         }
     }
 
@@ -76,14 +85,24 @@ class DistributorController(
         // nudge needed. Otherwise nudge the optional owner listener so it reconciles
         // now; if that's disabled/unreachable it falls back to the next owner run.
         val l = link
-        if (l != null) sendSnapshot(l) else nudgeOwner()
+        if (l != null) {
+            nudgeAfterLink = true
+            sendSnapshot(l)
+        } else {
+            nudgeOwner()
+        }
     }
 
     fun onUnregister(token: String) {
         val reg = store.markDeprovision(token) ?: return
         messenger.unregistered(reg.app, token)
         val l = link
-        if (l != null) sendSnapshot(l) else nudgeOwner()
+        if (l != null) {
+            nudgeAfterLink = true
+            sendSnapshot(l)
+        } else {
+            nudgeOwner()
+        }
     }
 
     // ---- frames from the owner link ----
@@ -92,9 +111,28 @@ class DistributorController(
         when (frame.type) {
             Protocol.ENDPOINT -> handleEndpoint(frame)
             Protocol.DEPROVISIONED -> handleDeprovisioned(Protocol.parseJson(frame).getString("token"))
+            Protocol.REGISTRATION_FAILED -> handleRegistrationFailed(frame)
             Protocol.PUSH -> handlePush(frame, l)
             else -> Logx.w("dist", "unexpected frame type=${frame.type}")
         }
+    }
+
+    /** The ntfy app could not provision this token; relay the failure to the app. */
+    fun onRegistrationFailed(token: String, reason: String = "INTERNAL_ERROR") {
+        val reg = store.byToken(token)
+        if (reg == null) {
+            Logx.w("dist", "registration failed for unknown token=$token")
+            return
+        }
+        messenger.registrationFailed(reg.app, token, reason)
+    }
+
+    private fun handleRegistrationFailed(frame: Frame) {
+        val o = Protocol.parseJson(frame)
+        onRegistrationFailed(
+            token = o.getString("token"),
+            reason = o.optString("reason", "INTERNAL_ERROR"),
+        )
     }
 
     private fun handleDeprovisioned(token: String) {

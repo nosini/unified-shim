@@ -10,9 +10,12 @@ import eu.nosini.unifiedshim.common.Logx
 import eu.nosini.unifiedshim.common.Notifications
 import eu.nosini.unifiedshim.role.Role
 import eu.nosini.unifiedshim.transport.BridgeLink
+import eu.nosini.unifiedshim.transport.acceptHello
 import eu.nosini.unifiedshim.transport.loopback.LoopbackServer
 import eu.nosini.unifiedshim.transport.protocol.Frame
 import eu.nosini.unifiedshim.transport.protocol.Protocol
+import java.util.Collections
+import java.util.concurrent.ConcurrentHashMap
 
 /**
  * Private-space foreground service. Owns the loopback listener and the
@@ -24,8 +27,14 @@ class DistributorService : Service() {
     private lateinit var controller: DistributorController
     private lateinit var server: LoopbackServer
 
+    private val helloOk: MutableSet<BridgeLink> =
+        Collections.newSetFromMap(ConcurrentHashMap<BridgeLink, Boolean>())
+    private val helloRejected: MutableSet<BridgeLink> =
+        Collections.newSetFromMap(ConcurrentHashMap<BridgeLink, Boolean>())
+
     override fun onCreate() {
         super.onCreate()
+        Config(this).distributorStartPending = false
         startForeground(
             Notifications.NOTIF_ID,
             Notifications.build(this, "Push bridge active"),
@@ -47,7 +56,11 @@ class DistributorService : Service() {
             // The owner connects per push and disconnects — link up/down is normal
             // and frequent, so we keep the notification text stable rather than flap.
             onLink = { Logx.i("dist", "owner connected, awaiting HELLO") },
-            onLinkClosed = { link -> controller.onOwnerLinkClosed(link) },
+            onLinkClosed = { link ->
+                helloOk.remove(link)
+                helloRejected.remove(link)
+                controller.onOwnerLinkClosed(link)
+            },
             onBound = { boundPort ->
                 // Persist the auto-assigned port and ALWAYS announce it on every
                 // successful bind: that is what tells the owner this profile's current
@@ -66,23 +79,25 @@ class DistributorService : Service() {
     }
 
     /**
-     * The owner (client) speaks HELLO first. We validate version + role, reply
-     * HELLO_ACK, then hand the link to the controller. Everything else is routed
-     * straight through.
+     * The owner (client) speaks HELLO first. Validate version + role, reply
+     * HELLO_ACK, then hand the link to the controller. Nothing else is routed until
+     * that handshake succeeds.
      */
     private fun onServerFrame(frame: Frame, link: BridgeLink) {
+        if (link in helloRejected) return
         if (frame.type == Protocol.HELLO) {
-            val o = Protocol.parseJson(frame)
-            val version = o.optInt("version", -1)
-            val role = o.optString("role")
-            val ok = version == Protocol.VERSION && role == Role.OWNER.name
-            link.send(Protocol.helloAck(ok, if (ok) null else "version/role mismatch"))
-            if (ok) {
+            if (acceptHello(frame, link, Role.OWNER.name)) {
+                helloOk.add(link)
                 controller.onOwnerLinkReady(link)
             } else {
-                Logx.w("dist", "rejecting owner HELLO version=$version role=$role")
+                helloRejected.add(link)
                 link.close()
             }
+            return
+        }
+        if (link !in helloOk) {
+            Logx.w("dist", "frame type=${frame.type} before HELLO; dropping")
+            link.close()
             return
         }
         controller.onFrame(frame, link)
@@ -92,8 +107,17 @@ class DistributorService : Service() {
         when (intent?.action) {
             UnifiedPush.ACTION_REGISTER -> {
                 val token = intent.getStringExtra(UnifiedPush.EXTRA_TOKEN)
-                val app = intent.getStringExtra(UnifiedPush.EXTRA_APPLICATION)
-                if (token != null && app != null) controller.onRegister(token, app)
+                if (token != null) {
+                    val app = UnifiedPush.applicationOf(intent)
+                    if (app != null) {
+                        controller.onRegister(token, app)
+                    } else {
+                        Logx.w("dist", "REGISTER token=$token has no resolvable app package")
+                        // A previously seen registration still gives us a target for
+                        // the spec-mandated failure reply.
+                        controller.onRegistrationFailed(token, "INTERNAL_ERROR")
+                    }
+                }
             }
             UnifiedPush.ACTION_UNREGISTER -> {
                 intent.getStringExtra(UnifiedPush.EXTRA_TOKEN)?.let { controller.onUnregister(it) }

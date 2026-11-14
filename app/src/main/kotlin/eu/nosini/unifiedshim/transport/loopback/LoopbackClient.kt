@@ -26,11 +26,12 @@ object LoopbackClient {
         port: Int,
         onFrame: (Frame, BridgeLink) -> Unit,
         onClosed: (BridgeLink) -> Unit,
+        connectTimeoutMs: Int = CONNECT_TIMEOUT,
     ): BridgeLink? {
         val sock = Socket()
         return try {
             sock.tcpNoDelay = true
-            sock.connect(InetSocketAddress("127.0.0.1", port), CONNECT_TIMEOUT)
+            sock.connect(InetSocketAddress("127.0.0.1", port), connectTimeoutMs)
             val input = DataInputStream(BufferedInputStream(sock.getInputStream()))
             val output = DataOutputStream(BufferedOutputStream(sock.getOutputStream()))
             sock.soTimeout = AUTH_TIMEOUT

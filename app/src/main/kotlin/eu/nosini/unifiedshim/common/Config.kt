@@ -56,10 +56,10 @@ class Config(context: Context) {
         get() = prefs.getBoolean(KEY_OWNER_LISTENER_ENABLED, false)
         set(v) = prefs.edit().putBoolean(KEY_OWNER_LISTENER_ENABLED, v).apply()
 
-    /** Loopback port the owner's auto-provision listener binds. */
-    var ownerListenerPort: Int
-        get() = prefs.getInt(KEY_OWNER_LISTENER_PORT, OWNER_LISTENER_PORT).takeIf { it in PORT_RANGE } ?: OWNER_LISTENER_PORT
-        set(v) = prefs.edit().putInt(KEY_OWNER_LISTENER_PORT, v.coerceIn(PORT_RANGE)).apply()
+    /** Loopback port the owner's auto-provision listener binds. Fixed to the default
+     *  nudge target: distributors have no UI for [ownerNudgePort], so letting the
+     *  owner drift to another port would silently break nudges. */
+    val ownerListenerPort: Int get() = OWNER_LISTENER_PORT
 
     /**
      * Distributor-side: the owner's listener port to nudge on a registration change.
@@ -70,20 +70,25 @@ class Config(context: Context) {
         get() = prefs.getInt(KEY_OWNER_NUDGE_PORT, OWNER_LISTENER_PORT)
         set(v) = prefs.edit().putInt(KEY_OWNER_NUDGE_PORT, v).apply()
 
+    /** Set when a background FGS start was blocked; retried on the next app open. */
+    var distributorStartPending: Boolean
+        get() = prefs.getBoolean(KEY_DISTRIBUTOR_START_PENDING, false)
+        set(v) = prefs.edit().putBoolean(KEY_DISTRIBUTOR_START_PENDING, v).apply()
+
     companion object {
         /** Single lock guarding every read-modify-write of [ownerBridgePorts] (see
-         *  [addOwnerBridgePort]). Distinct learners race here — NUDGE reader threads
-         *  and OwnerBridge scan sessions — so all growth of the list goes through this
-         *  one lock. The plain [ownerBridgePorts] setter is only invoked from inside
-         *  [addOwnerBridgePort] (under this lock), so there is no unguarded writer. */
+         *  [addOwnerBridgePort] / [removeOwnerBridgePort]). Distinct learners race
+         *  here — nudge reconcile threads and OwnerBridge sweep sessions — so all
+         *  growth of the list goes through this one lock. The plain
+         *  [ownerBridgePorts] setter is only invoked from inside these helpers
+         *  (under this lock), so there is no unguarded writer. */
         private val ownerPortsLock = Any()
 
         /**
          * Learn a distributor port: add [port] to [ownerBridgePorts] if absent. The
          * only writer of the list, so the read-modify-write can't lose a concurrent
-         * learn. Called by the NUDGE handler (announced port) and by OwnerBridge after
-         * a successful scan handshake (discovered port). Stale learned ports are never
-         * pruned — a moved distributor just fast-fails on connect each sweep.
+         * learn. Called by OwnerBridge after a successful scan handshake (discovered
+         * port). Repeatedly unreachable learned ports are pruned by OwnerBridge.
          */
         fun addOwnerBridgePort(context: Context, port: Int) {
             if (port !in PORT_RANGE) return
@@ -96,12 +101,26 @@ class Config(context: Context) {
             }
         }
 
+        /** Drop a learned port after repeated failed sweeps. Default scan-range
+         *  candidates are left alone (they are re-probed anyway). */
+        fun removeOwnerBridgePort(context: Context, port: Int) {
+            if (port in PORT_SCAN_RANGE) return
+            synchronized(ownerPortsLock) {
+                val cfg = Config(context)
+                val current = cfg.ownerBridgePorts
+                if (port in current) {
+                    cfg.ownerBridgePorts = current - port
+                    Logx.i("cfg", "forgot unreachable distributor port :$port")
+                }
+            }
+        }
+
         private const val KEY_FORCED_ROLE = "forced_role"
         private const val KEY_BRIDGE_PORT = "bridge_port"
         private const val KEY_OWNER_PORTS = "owner_bridge_ports"
         private const val KEY_OWNER_LISTENER_ENABLED = "owner_listener_enabled"
-        private const val KEY_OWNER_LISTENER_PORT = "owner_listener_port"
         private const val KEY_OWNER_NUDGE_PORT = "owner_nudge_port"
+        private const val KEY_DISTRIBUTOR_START_PENDING = "distributor_start_pending"
 
         /** Valid TCP port range for a user-configured bridge port. */
         val PORT_RANGE = 1024..65535

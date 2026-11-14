@@ -5,9 +5,12 @@ import eu.nosini.unifiedshim.common.Config
 import eu.nosini.unifiedshim.common.Logx
 import eu.nosini.unifiedshim.role.Role
 import eu.nosini.unifiedshim.transport.BridgeLink
+import eu.nosini.unifiedshim.transport.acceptHello
 import eu.nosini.unifiedshim.transport.loopback.LoopbackServer
 import eu.nosini.unifiedshim.transport.protocol.Frame
 import eu.nosini.unifiedshim.transport.protocol.Protocol
+import java.util.Collections
+import java.util.concurrent.ConcurrentHashMap
 
 /**
  * Owner-side nudge listener. A distributor connects to [Config.ownerListenerPort],
@@ -26,6 +29,11 @@ object NudgeListener {
     private val holders = mutableSetOf<String>()
     private var server: LoopbackServer? = null
 
+    private val helloOk: MutableSet<BridgeLink> =
+        Collections.newSetFromMap(ConcurrentHashMap<BridgeLink, Boolean>())
+    private val helloRejected: MutableSet<BridgeLink> =
+        Collections.newSetFromMap(ConcurrentHashMap<BridgeLink, Boolean>())
+
     /** Start the listener if not running; idempotent per holder. */
     fun acquire(context: Context, holder: String) {
         val app = context.applicationContext
@@ -43,16 +51,6 @@ object NudgeListener {
         }
     }
 
-    /** Rebind after a listener-port change — only if currently running. */
-    fun restart(context: Context) {
-        val app = context.applicationContext
-        synchronized(lock) {
-            if (holders.isEmpty()) return
-            stopServer()
-            startServer(app)
-        }
-    }
-
     private fun startServer(context: Context) {
         val port = Config(context).ownerListenerPort
         Logx.i("ownerL", "binding nudge listener on :$port")
@@ -61,7 +59,11 @@ object NudgeListener {
             candidates = { listOf(port) },
             onFrame = { frame, link -> onServerFrame(context, frame, link) },
             onLink = { Logx.i("ownerL", "distributor connected, awaiting HELLO") },
-            onLinkClosed = { Logx.d("ownerL", "distributor link closed") },
+            onLinkClosed = { link ->
+                helloOk.remove(link)
+                helloRejected.remove(link)
+                Logx.d("ownerL", "distributor link closed")
+            },
         ).also { it.start() }
     }
 
@@ -72,38 +74,43 @@ object NudgeListener {
 
     /**
      * The distributor (client) speaks HELLO first. Validate version + role (expect
-     * PRIVATE), reply HELLO_ACK, then handle NUDGE. Nothing else is expected here.
+     * PRIVATE), reply HELLO_ACK, then handle NUDGE. Nothing else is routed until
+     * that handshake succeeds.
      */
     private fun onServerFrame(context: Context, frame: Frame, link: BridgeLink) {
-        when (frame.type) {
-            Protocol.HELLO -> {
-                val o = Protocol.parseJson(frame)
-                val version = o.optInt("version", -1)
-                val role = o.optString("role")
-                val ok = version == Protocol.VERSION && role == Role.PRIVATE.name
-                link.send(Protocol.helloAck(ok, if (ok) null else "version/role mismatch"))
-                if (!ok) {
-                    Logx.w("ownerL", "rejecting HELLO version=$version role=$role")
-                    link.close()
-                }
+        if (link in helloRejected) return
+        if (frame.type == Protocol.HELLO) {
+            if (acceptHello(frame, link, Role.PRIVATE.name)) {
+                helloOk.add(link)
+            } else {
+                helloRejected.add(link)
+                link.close()
             }
+            return
+        }
+        if (link !in helloOk) {
+            Logx.w("ownerL", "frame type=${frame.type} before HELLO; dropping")
+            link.close()
+            return
+        }
+        when (frame.type) {
             Protocol.NUDGE -> handleNudge(context, frame, link)
             else -> Logx.w("ownerL", "unexpected frame type=${frame.type}")
         }
     }
 
     private fun handleNudge(context: Context, frame: Frame, link: BridgeLink) {
+        val cfg = Config(context)
         val port = Protocol.parseJson(frame).optInt("port", -1)
-        if (port !in Config.PORT_RANGE) {
+        // Never learn our own listener (and never dial it), and ignore nonsense ports.
+        if (port !in Config.PORT_RANGE || port == cfg.ownerListenerPort) {
             Logx.w("ownerL", "nudge with invalid port=$port")
             link.close()
             return
         }
-        // Auth already proved the peer is our own signed APK in another profile, so
-        // auto-learning its port is safe. The RMW is centralized under Config's lock.
-        Config.addOwnerBridgePort(context, port)
         link.close()
         // Reconcile off the socket reader thread so it isn't blocked on the round-trip.
+        // The port is only persisted after that distributor handshake succeeds.
         Thread({ OwnerBridge.reconcilePort(context, port) }, "owner-nudge-reconcile")
             .apply { isDaemon = true }.start()
     }

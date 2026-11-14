@@ -1,15 +1,12 @@
 package eu.nosini.unifiedshim.distributor
 
 import android.content.Context
-import android.os.Process
 import eu.nosini.unifiedshim.common.Config
 import eu.nosini.unifiedshim.common.Logx
 import eu.nosini.unifiedshim.role.Role
+import eu.nosini.unifiedshim.transport.ClientHello
 import eu.nosini.unifiedshim.transport.loopback.LoopbackClient
 import eu.nosini.unifiedshim.transport.protocol.Protocol
-import java.util.concurrent.CountDownLatch
-import java.util.concurrent.TimeUnit
-import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * Distributor-side one-shot nudge to the optional owner auto-provision listener.
@@ -30,25 +27,18 @@ object OwnerNudger {
             Logx.d("nudge", "owner nudging disabled (port=$ownerPort)")
             return
         }
-        val ackLatch = CountDownLatch(1)
-        val ok = AtomicBoolean(false)
+        val hello = ClientHello(Role.PRIVATE.name, ACK_TIMEOUT_MS)
         val link = LoopbackClient.connectOnce(
             context, ownerPort,
-            onFrame = { frame, _ ->
-                if (frame.type == Protocol.HELLO_ACK) {
-                    ok.set(Protocol.parseJson(frame).optBoolean("ok", false))
-                    ackLatch.countDown()
-                }
-            },
-            onClosed = { ackLatch.countDown() },
+            onFrame = { frame, _ -> hello.onFrame(frame) },
+            onClosed = { hello.onClosed() },
         )
         if (link == null) {
             Logx.d("nudge", "owner listener unreachable on :$ownerPort")
             return
         }
         try {
-            link.send(Protocol.hello(Role.PRIVATE.name, Process.myUid() % 100_000, Process.myUid() / 100_000))
-            if (!ackLatch.await(ACK_TIMEOUT_MS, TimeUnit.MILLISECONDS) || !ok.get()) {
+            if (!hello.handshake(link)) {
                 Logx.d("nudge", "no HELLO_ACK from owner listener on :$ownerPort")
                 return
             }

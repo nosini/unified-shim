@@ -3,9 +3,9 @@ package eu.nosini.unifiedshim.ui
 import android.Manifest
 import android.app.Activity
 import android.content.pm.PackageManager
+import android.os.Build
 import android.os.Bundle
 import android.os.Process
-import android.text.InputType
 import android.view.View
 import android.widget.Button
 import android.widget.EditText
@@ -16,7 +16,9 @@ import android.widget.Toast
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.updatePadding
+import eu.nosini.unifiedshim.App
 import eu.nosini.unifiedshim.common.Config
+import eu.nosini.unifiedshim.common.Logx
 import eu.nosini.unifiedshim.distributor.DistributorService
 import eu.nosini.unifiedshim.distributor.EndpointStore
 import eu.nosini.unifiedshim.owner.NudgeListener
@@ -25,7 +27,9 @@ import eu.nosini.unifiedshim.owner.OwnerListenerService
 import eu.nosini.unifiedshim.owner.OwnerStore
 import eu.nosini.unifiedshim.role.Role
 import eu.nosini.unifiedshim.role.RoleDetector
+import eu.nosini.unifiedshim.role.ServiceLauncher
 import org.unifiedpush.android.connector.UnifiedPush
+import java.lang.ref.WeakReference
 
 /**
  * Status + control screen. Built in code to avoid layout resources. The owner
@@ -82,7 +86,10 @@ class MainActivity : Activity() {
         // While the owner screen is open, host the nudge listener so a distributor's
         // announce lands with no FGS. applicationContext so the server never references
         // the activity; the "activity" holder is released in onStop.
-        if (RoleDetector.detect(this) == Role.OWNER) NudgeListener.acquire(applicationContext, "activity")
+        when (RoleDetector.detect(this)) {
+            Role.OWNER -> NudgeListener.acquire(applicationContext, "activity")
+            Role.PRIVATE -> retryPendingDistributorStart()
+        }
     }
 
     override fun onStop() {
@@ -94,6 +101,18 @@ class MainActivity : Activity() {
         super.onResume()
         // Opening the owner app is the manual provisioning trigger.
         if (RoleDetector.detect(this) == Role.OWNER) syncOwner()
+    }
+
+    /** A background FGS start was blocked earlier; retry now that we're in front. */
+    private fun retryPendingDistributorStart() {
+        val cfg = Config(this)
+        if (!cfg.distributorStartPending) return
+        try {
+            DistributorService.ensureStarted(this)
+            cfg.distributorStartPending = false
+        } catch (e: Exception) {
+            Logx.w("ui", "could not retry distributor service start: ${e.message}")
+        }
     }
 
     private fun refresh() {
@@ -116,17 +135,13 @@ class MainActivity : Activity() {
                 controls.addView(button("Auto-provision listener: ${if (cfg.ownerListenerEnabled) "ON" else "OFF"}") {
                     toggleOwnerListener()
                 })
-                controls.addView(TextView(this).apply { text = "Listener port (must differ from distributor ports):" })
-                controls.addView(
-                    singlePortField(cfg.ownerListenerPort.toString(), "Apply listener port") { applyOwnerListenerPort(it) }
-                )
+                controls.addView(TextView(this).apply {
+                    text = "Listener port: ${Config.OWNER_LISTENER_PORT} (fixed, matches distributor nudge)"
+                })
                 controls.addView(TextView(this).apply { text = "\nSelect ntfy app as distributor:" })
                 val self = packageName
                 UnifiedPush.getDistributors(this).filter { it != self }.forEach { dist ->
-                    controls.addView(button("Use: $dist") {
-                        UnifiedPush.saveDistributor(this, dist)
-                        syncOwner()
-                    })
+                    controls.addView(button("Use: $dist") { selectDistributor(dist) })
                 }
             }
         }
@@ -142,22 +157,32 @@ class MainActivity : Activity() {
                 Role.OWNER -> Role.PRIVATE
                 Role.PRIVATE -> null
             }
+            // Re-gate the manifest components for the new role before recreating, then
+            // bring up the service that role needs.
+            App.gateComponentsForRole(this)
+            runCatching { ServiceLauncher.startForRole(this) }
+                .onFailure { Logx.w("ui", "could not start service for new role: ${it.message}") }
             recreate()
         }
     }
 
-    /** A single numeric port field + Apply, for the owner's listener port. */
-    private fun singlePortField(initial: String, applyLabel: String, onApply: (String) -> Unit): LinearLayout {
-        val row = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        val edit = EditText(this).apply {
-            inputType = InputType.TYPE_CLASS_NUMBER
-            setSingleLine()
-            layoutParams = LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f)
-            setText(initial)
+    /** Switch ntfy distributors: drop stale endpoints and re-register every token we
+     *  know with the new distributor. We deliberately don't unregisterApp() with the
+     *  old one: its UNREGISTERED reply lands in onUnregistered, which would forget the
+     *  token and deprovision the app. The old endpoints simply stop receiving traffic
+     *  once the apps get their new endpoints. */
+    private fun selectDistributor(dist: String) {
+        val old = UnifiedPush.getSavedDistributor(this)
+        if (old == dist) {
+            syncOwner()
+            return
         }
-        row.addView(edit)
-        row.addView(button(applyLabel) { onApply(edit.text.toString()) })
-        return row
+        val store = OwnerStore.get(this)
+        val tokens = store.knownTokens()
+        UnifiedPush.saveDistributor(this, dist)
+        store.clearEndpoints()
+        tokens.forEach { token -> runCatching { UnifiedPush.registerApp(this, token) } }
+        syncOwner()
     }
 
     private fun toggleOwnerListener() {
@@ -169,26 +194,11 @@ class MainActivity : Activity() {
         refresh()
     }
 
-    private fun applyOwnerListenerPort(raw: String) {
-        val cfg = Config(this)
-        val port = raw.trim().toIntOrNull()
-        if (port == null || port !in Config.PORT_RANGE) {
-            toast("Port must be ${Config.PORT_RANGE.first}..${Config.PORT_RANGE.last}")
-            return
-        }
-        val changed = port != cfg.ownerListenerPort
-        cfg.ownerListenerPort = port
-        // Rebind if the listener is currently up under either holder (FGS/activity).
-        if (changed) NudgeListener.restart(applicationContext)
-        toast("Listener port set to $port")
-        refresh()
-    }
-
     private fun buildStatus(role: Role): String = buildString {
         appendLine("Role: $role")
         appendLine("UID: ${Process.myUid()} (appId=${Process.myUid() % 100_000}, user=${Process.myUid() / 100_000})")
         // Android 17 (API 37) gates cross-profile loopback behind INTERACT_ACROSS_USERS.
-        if (android.os.Build.VERSION.SDK_INT >= 37) {
+        if (Build.VERSION.SDK_INT >= 37) {
             appendLine()
             val user = Process.myUid() / 100_000
             if (checkSelfPermission(Config.PERM_INTERACT_ACROSS_USERS) == PackageManager.PERMISSION_GRANTED) {
@@ -238,8 +248,26 @@ class MainActivity : Activity() {
     }
 
     private fun syncOwner() {
-        Thread { OwnerBridge.reconcile(this) }.apply { isDaemon = true }.start()
-        status.postDelayed({ refresh() }, 1_500)
+        val appContext = applicationContext
+        val activity = WeakReference(this)
+        Thread {
+            OwnerBridge.reconcile(appContext) {
+                val a = activity.get() ?: return@reconcile
+                a.runOnUiThread {
+                    if (!a.isFinishing && !a.isDestroyed) a.refreshAfterReconcile()
+                }
+            }
+        }.apply { isDaemon = true }.start()
+    }
+
+    private fun refreshAfterReconcile() {
+        if (isFinishing || isDestroyed) return
+        // Don't rebuild the controls out from under an active editor; status is safe.
+        if (currentFocus is EditText) {
+            status.text = buildStatus(RoleDetector.detect(this))
+            return
+        }
+        refresh()
     }
 
     private fun button(label: String, onClick: () -> Unit) = Button(this).apply {
@@ -257,7 +285,9 @@ class MainActivity : Activity() {
     private fun toast(msg: String) = Toast.makeText(this, msg, Toast.LENGTH_SHORT).show()
 
     private fun requestNotificationsIfNeeded() {
-        if (checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+        if (Build.VERSION.SDK_INT >= 33 &&
+            checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+        ) {
             requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1)
         }
     }

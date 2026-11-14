@@ -21,11 +21,11 @@ android {
     defaultConfig {
         applicationId = "eu.nosini.unifiedshim"
         // Private space is API 35; the owner side runs fine lower. 29 keeps the
-        // owner side broadly compatible while abstract sockets + FGS are available.
+        // owner side broadly compatible while loopback TCP + FGS are available.
         minSdk = 29
         targetSdk = 35
-        versionCode = 6
-        versionName = "0.5.0"
+        versionCode = 7
+        versionName = "0.6.0"
     }
 
     signingConfigs {

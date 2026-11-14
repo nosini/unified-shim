@@ -13,7 +13,16 @@ import eu.nosini.unifiedshim.role.ServiceLauncher
  */
 class BootReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
-        Logx.i("boot", "received ${intent.action}")
-        ServiceLauncher.startForRole(context)
+        val action = intent.action ?: return
+        Logx.i("boot", "received $action")
+        when (action) {
+            Intent.ACTION_BOOT_COMPLETED,
+            Intent.ACTION_MY_PACKAGE_REPLACED -> try {
+                ServiceLauncher.startForRole(context)
+            } catch (e: Exception) {
+                Logx.e("boot", "could not start service after $action", e)
+            }
+            else -> Logx.d("boot", "ignoring $action")
+        }
     }
 }

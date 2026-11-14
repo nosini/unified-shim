@@ -1,11 +1,53 @@
 package eu.nosini.unifiedshim.transport
 
+import android.os.Process
 import eu.nosini.unifiedshim.common.Logx
 import eu.nosini.unifiedshim.transport.protocol.Frame
+import eu.nosini.unifiedshim.transport.protocol.Protocol
 import java.io.Closeable
 import java.io.DataInputStream
 import java.io.DataOutputStream
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+
+/** Server-side HELLO validation shared by the distributor and nudge listeners. */
+fun acceptHello(frame: Frame, link: BridgeLink, expectedRole: String): Boolean {
+    val o = Protocol.parseJson(frame)
+    val version = o.optInt("version", -1)
+    val role = o.optString("role")
+    val ok = version == Protocol.VERSION && role == expectedRole
+    link.send(Protocol.helloAck(ok, if (ok) null else "version/role mismatch"))
+    if (!ok) Logx.w("hello", "rejecting HELLO version=$version role=$role expected=$expectedRole")
+    return ok
+}
+
+/** Client-side HELLO exchange: send HELLO, then wait for the matching ack. */
+class ClientHello(private val role: String, private val timeoutMs: Long) {
+    private val ack = CountDownLatch(1)
+    @Volatile private var accepted = false
+
+    /** Feed every inbound frame; returns true when it consumed a HELLO_ACK. */
+    fun onFrame(frame: Frame): Boolean {
+        if (frame.type != Protocol.HELLO_ACK) return false
+        accepted = Protocol.parseJson(frame).optBoolean("ok", false)
+        ack.countDown()
+        return true
+    }
+
+    fun onClosed() {
+        ack.countDown()
+    }
+
+    fun handshake(link: BridgeLink): Boolean {
+        link.send(Protocol.hello(role, Process.myUid() % 100_000, Process.myUid() / 100_000))
+        return try {
+            ack.await(timeoutMs, TimeUnit.MILLISECONDS) && accepted
+        } catch (_: InterruptedException) {
+            false
+        }
+    }
+}
 
 /**
  * An authenticated, bidirectional, framed connection. Stream-based so it works

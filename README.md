@@ -174,9 +174,9 @@ default `28472`; the kernel is the arbiter and the pieces below resolve it:
   snapshot membership is the only ground truth for what a distributor owns.
 
 Persisted in `Config` (`bridgePort` = last-bound, `ownerBridgePorts` = learned set)
-and, on the owner, the `token → port` map in `OwnerStore`. The one remaining port
-knob is the owner's **listener port** (default `28471`), which must differ from the
-distributor range.
+and, on the owner, the `token → port` map in `OwnerStore`. The owner's **listener
+port** is fixed at `28471`, outside the distributor range, because distributors
+always nudge that port.
 
 ---
 
@@ -209,22 +209,22 @@ registration state change (when no owner link is live), and the
 owner-initiated traffic, so there's no feedback loop. A dead or disabled listener is
 indistinguishable from manual mode (every nudge is best-effort and swallowed).
 
-The owner **auto-learns distributor ports**: the auth handshake proves the peer is
-our own signed APK in another profile, so a nudged port (or one discovered by the
-[scan fallback](#port-auto-discovery)) is added to the learned set automatically — no
-owner-side port config. The read-modify-write is centralized in
-`Config.addOwnerBridgePort` under a single lock.
+The owner **auto-learns distributor ports**: a nudged port (or one discovered by the
+[scan fallback](#port-auto-discovery)) is added to the learned set once the owner
+completes a handshake with the distributor on it — no owner-side port config. Learned
+ports outside the scan range are dropped after 5 sweeps without an answer. The
+read-modify-write is centralized in `Config` under a single lock.
 
-Setup: tap **Auto-provision listener: OFF** to turn it **ON** (OWNER screen). Note
-the listener port (default `28471`); change it with **Apply listener port** if
-needed. There is nothing to configure on the distributor side.
+Setup: tap **Auto-provision listener: OFF** to turn it **ON** (OWNER screen). The
+listener port is fixed at `28471`. There is nothing to configure on the distributor
+side.
 
 The listener shares the device's single loopback netns with every distributor
 listener, so its port must be **distinct from the distributor range**
 (`28471` vs `28472..28479` already is) — a collision leaves whichever side binds
 second stuck retrying.
 
-Persisted in `Config` (`ownerListenerEnabled`, `ownerListenerPort`). The FGS is
+Persisted in `Config` (`ownerListenerEnabled`). The FGS is
 started from the owner toggle and, on boot, by `BootReceiver` when
 `ownerListenerEnabled`. (`Config.ownerNudgePort`, the distributor's nudge target,
 has no UI — it defaults to `28471` and is left for power users to override via

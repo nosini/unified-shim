@@ -18,6 +18,7 @@ import java.nio.charset.StandardCharsets
  *                            plus tokens awaiting deprovision.
  *   owner→priv:              ENDPOINT (an endpoint the ntfy app minted),
  *                            DEPROVISIONED (a token released from the ntfy app),
+ *                            REGISTRATION_FAILED (the ntfy app rejected a token),
  *                            PUSH (an inbound message, binary).
  *   priv→owner:              PUSH_ACK.
  *
@@ -25,13 +26,14 @@ import java.nio.charset.StandardCharsets
  * RFC 8291 (aes128gcm) Web Push payloads.
  */
 object Protocol {
-    const val VERSION = 2
+    const val VERSION = 3
 
     const val HELLO: Byte = 0x01
     const val HELLO_ACK: Byte = 0x02
     const val REGISTRATIONS: Byte = 0x10
     const val ENDPOINT: Byte = 0x11
     const val DEPROVISIONED: Byte = 0x12
+    const val REGISTRATION_FAILED: Byte = 0x13
     const val PUSH: Byte = 0x20
     const val PUSH_ACK: Byte = 0x21
 
@@ -81,7 +83,15 @@ object Protocol {
     fun deprovisioned(token: String) =
         json(DEPROVISIONED, JSONObject().put("token", token))
 
+    fun registrationFailed(token: String, reason: String) =
+        json(REGISTRATION_FAILED, JSONObject().put("token", token).put("reason", reason))
+
     // ---- data (binary) ----
+
+    /** Body size of a [push] frame, for rejecting payloads that would exceed
+     *  [Frame.MAX_FRAME] before allocating/sending them. */
+    fun pushBodySize(token: String, payload: ByteArray): Int =
+        8 + 2 + token.toByteArray(StandardCharsets.UTF_8).size + payload.size
 
     /** PUSH body: [int64 msgId][int16 tokenLen][token utf8][payload...]. */
     fun push(msgId: Long, token: String, payload: ByteArray): Frame {
