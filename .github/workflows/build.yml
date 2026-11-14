@@ -6,6 +6,10 @@ on:
     tags: ['v*']
   workflow_dispatch:
 
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: false
+
 permissions:
   contents: read
 
@@ -13,59 +17,176 @@ jobs:
   build:
     runs-on: ubuntu-latest
     permissions:
-      contents: write # create the release on tag pushes
+      contents: read
+    outputs:
+      apk: ${{ steps.apk.outputs.file }}
+      artifact: ${{ steps.apk.outputs.artifact }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
 
-      - uses: actions/setup-java@v6
+      - name: Read version
+        id: version
+        run: |
+          set -euo pipefail
+          count=$(grep -c -E '^\s*versionName\s*=\s*"([^"]+)"\s*$' app/build.gradle.kts || true)
+          if [ "$count" -ne 1 ]; then
+            echo "::error::expected exactly one versionName line in app/build.gradle.kts, found $count"
+            exit 1
+          fi
+          version=$(sed -n -E 's/^\s*versionName\s*=\s*"([^"]+)"\s*$/\1/p' app/build.gradle.kts)
+          if ! [[ "$version" =~ ^[0-9A-Za-z._-]+$ ]]; then
+            echo "::error::versionName '$version' has unsupported characters"
+            exit 1
+          fi
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            if [ "$GITHUB_REF_NAME" != "v$version" ]; then
+              echo "::error::tag $GITHUB_REF_NAME doesn't match versionName $version"
+              exit 1
+            fi
+            git fetch --no-tags origin main
+            if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+              echo "::error::tag $GITHUB_REF_NAME is not reachable from main"
+              exit 1
+            fi
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Check signing configuration
+        id: signing
+        env:
+          KEYSTORE_BASE64: ${{ secrets.SIGNING_KEYSTORE_BASE64 }}
+          STORE_PASSWORD: ${{ secrets.SIGNING_STORE_PASSWORD }}
+        run: |
+          set -euo pipefail
+          enabled=false
+          if [[ "$GITHUB_REF" == refs/heads/main || "$GITHUB_REF" == refs/tags/v* ]]; then
+            if [ -n "$KEYSTORE_BASE64" ]; then
+              enabled=true
+            elif [[ "$GITHUB_REF" == refs/tags/* ]]; then
+              echo "::error::SIGNING_KEYSTORE_BASE64 is required for tag builds"
+              exit 1
+            fi
+            if [[ "$GITHUB_REF" == refs/tags/* && -z "$STORE_PASSWORD" ]]; then
+              echo "::error::SIGNING_STORE_PASSWORD is required for tag builds"
+              exit 1
+            fi
+          fi
+          echo "enabled=$enabled" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-java@d1374f8ac74474200d16ef8ecee22c7ae7a51880 # v6.3.0
         with:
           distribution: temurin
           java-version: '17'
-
-      - uses: gradle/actions/setup-gradle@v6
+          cache: gradle
 
       - name: Decode signing key
+        if: steps.signing.outputs.enabled == 'true'
         env:
           KEYSTORE_BASE64: ${{ secrets.SIGNING_KEYSTORE_BASE64 }}
         run: |
-          if [ -z "$KEYSTORE_BASE64" ]; then
-            echo "::error::SIGNING_KEYSTORE_BASE64 secret is not set"
-            exit 1
-          fi
+          set -euo pipefail
           echo "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/release.jks"
 
-      - name: Build release APK
+      - name: Warn about unsigned build
+        if: steps.signing.outputs.enabled != 'true'
+        run: |
+          echo "::warning::Signing is only enabled for main and v* tags with SIGNING_KEYSTORE_BASE64 set; building an unsigned APK"
+
+      - name: Build signed release APK
+        if: steps.signing.outputs.enabled == 'true'
         env:
           SIGNING_STORE_FILE: ${{ runner.temp }}/release.jks
           SIGNING_STORE_PASSWORD: ${{ secrets.SIGNING_STORE_PASSWORD }}
           SIGNING_KEY_ALIAS: unifiedshim
         run: ./gradlew :app:assembleRelease
 
+      - name: Build unsigned release APK
+        if: steps.signing.outputs.enabled != 'true'
+        run: ./gradlew :app:assembleRelease
+
       - name: Check signature
+        if: steps.signing.outputs.enabled == 'true'
+        env:
+          EXPECTED_SHA256: ${{ vars.SIGNING_CERT_SHA256 }}
         run: |
-          apksigner="$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)/apksigner"
-          "$apksigner" verify --print-certs app/build/outputs/apk/release/app-release.apk
+          set -euo pipefail
+          if [ -z "$EXPECTED_SHA256" ]; then
+            echo "::error::repository variable SIGNING_CERT_SHA256 is not set"
+            exit 1
+          fi
+          apksigner="$(find "$ANDROID_HOME/build-tools" -mindepth 1 -maxdepth 1 -type d \
+            | sort -V | tail -1)/apksigner"
+          actual="$("$apksigner" verify --print-certs app/build/outputs/apk/release/app-release.apk \
+            | sed -n -E 's/^.*[Ss]igner.* certificate SHA-256 digest: *([0-9a-fA-F:]+)$/\1/p' \
+            | tr -d ':' | tr '[:upper:]' '[:lower:]' | sort -u)"
+          expected="$(echo "$EXPECTED_SHA256" | tr -d ': ' | tr '[:upper:]' '[:lower:]')"
+          # apksigner prints "Signer #1 ..." or "V2 Signer: ..." depending on version;
+          # require exactly one distinct signer certificate.
+          if [ -z "$actual" ] || [ "$(echo "$actual" | wc -l)" -ne 1 ]; then
+            echo "::error::expected exactly one signer certificate SHA-256 digest, got: ${actual:-none}"
+            exit 1
+          fi
+          if [ "$actual" != "$expected" ]; then
+            echo "::error::signing certificate mismatch: expected $expected, got $actual"
+            exit 1
+          fi
 
       - name: Name the APK
         id: apk
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          SIGNED: ${{ steps.signing.outputs.enabled }}
         run: |
-          version=$(sed -n 's/.*versionName = "\(.*\)"/\1/p' app/build.gradle.kts)
-          if [[ "$GITHUB_REF" == refs/tags/* && "$GITHUB_REF_NAME" != "v$version" ]]; then
-            echo "::error::tag $GITHUB_REF_NAME doesn't match versionName $version"
-            exit 1
+          set -euo pipefail
+          if [ "$SIGNED" = "true" ]; then
+            src="app/build/outputs/apk/release/app-release.apk"
+            file="unified-shim-$VERSION.apk"
+          else
+            src="app/build/outputs/apk/release/app-release-unsigned.apk"
+            file="unified-shim-$VERSION-unsigned.apk"
           fi
-          name="unified-shim-$version.apk"
-          cp app/build/outputs/apk/release/app-release.apk "$name"
-          echo "name=$name" >> "$GITHUB_OUTPUT"
+          if [[ "$GITHUB_REF" != refs/tags/* ]]; then
+            file="${file%.apk}-${GITHUB_SHA::7}.apk"
+          fi
+          cp "$src" "$file"
+          echo "file=$file" >> "$GITHUB_OUTPUT"
+          echo "artifact=${file%.apk}" >> "$GITHUB_OUTPUT"
 
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
-          name: ${{ steps.apk.outputs.name }}
-          path: ${{ steps.apk.outputs.name }}
+          name: ${{ steps.apk.outputs.artifact }}
+          path: ${{ steps.apk.outputs.file }}
           if-no-files-found: error
 
+      - name: Remove decoded keystore
+        if: always()
+        run: rm -f "$RUNNER_TEMP/release.jks"
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: ${{ needs.build.outputs.artifact }}
+          path: dist
+
       - name: Publish release
-        if: startsWith(github.ref, 'refs/tags/v')
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" "${{ steps.apk.outputs.name }}" --title "$GITHUB_REF_NAME" --generate-notes
+          TAG: ${{ github.ref_name }}
+          APK: ${{ needs.build.outputs.apk }}
+        run: |
+          set -euo pipefail
+          file="dist/$APK"
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$TAG" "$file" --clobber --repo "$GITHUB_REPOSITORY"
+            gh release edit "$TAG" --draft=false --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create "$TAG" "$file" --verify-tag --title "$TAG" --generate-notes --repo "$GITHUB_REPOSITORY"
+          fi

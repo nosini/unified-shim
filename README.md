@@ -267,7 +267,15 @@ tag must match `versionName`. The workflow needs two repository secrets:
 - `SIGNING_KEYSTORE_BASE64` — the keystore, base64-encoded (`base64 -w0 release.jks`)
 - `SIGNING_STORE_PASSWORD` — its password (PKCS12, so it's also the key password)
 
-The key alias is `unifiedshim`.
+The key alias is `unifiedshim`. It also needs a repository variable,
+`SIGNING_CERT_SHA256` — the SHA-256 of the signing certificate, printed by
+`keytool -list -v` or `apksigner verify --print-certs`, which the workflow checks
+against the built APK. Only `main` and `v*` tag builds are signed; other branches
+and forks build unsigned.
+
+Each run uploads an artifact holding `unified-shim-$version.apk` when signed or
+`unified-shim-$version-unsigned.apk` otherwise; non-tag builds also add the short
+commit hash (artifact `unified-shim-0.5.0-abc1234`).
 
 To build locally (Gradle 8.14.2 / AGP 8.7.3 / Kotlin 2.1.0), point `sdk.dir` in
 `local.properties` or `ANDROID_HOME` at an Android SDK and put the signing details
@@ -279,7 +287,11 @@ storePassword=...
 keyAlias=unifiedshim
 ```
 
-Without it, `assembleRelease` produces an unsigned APK.
+Without `keystore.properties`, `assembleRelease` writes
+`app/build/outputs/apk/release/app-release-unsigned.apk`, which can't be installed
+as is — install the signed APK from CI, or add the file above. An incomplete
+`keystore.properties` (missing password or alias, or a `storeFile` that doesn't
+exist) fails the build with a clear error.
 
 ```bash
 ./gradlew :app:assembleRelease
